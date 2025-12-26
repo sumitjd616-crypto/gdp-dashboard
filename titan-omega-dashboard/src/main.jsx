@@ -1,10 +1,10 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import TitanOmegaDashboard from './TitanOmegaDashboard';
+import TitanOmegaDashboardLive from './TitanOmegaDashboardLive';
 import './index.css';
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <TitanOmegaDashboard />
+    <TitanOmegaDashboardLive />
   </React.StrictMode>
 );
