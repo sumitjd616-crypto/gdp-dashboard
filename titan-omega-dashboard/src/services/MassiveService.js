@@ -147,6 +147,15 @@ class MassiveService {
     return this.data;
   }
 
+  async fetchDailyBars(days = 10) {
+    const res = await fetch(`/api/daily?days=${encodeURIComponent(String(days))}`, {
+      headers: PROXY_TOKEN ? { 'x-titan-token': PROXY_TOKEN } : {},
+    });
+    const json = await res.json();
+    if (!res.ok || !json?.ok) throw new Error(json?.error || 'REST /api/daily failed');
+    return Array.isArray(json.bars) ? json.bars : [];
+  }
+
   connectIndices() {
     this.disconnectAll();
 
@@ -216,6 +225,19 @@ class MassiveService {
           if (bar.close != null) this.data.SPX = { price: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
           this.saveSession();
           this.onDataUpdate?.('bar', 'SPX', bar);
+        }
+        return;
+      }
+
+      if (messages.type === 'VIX_BAR') {
+        const bar = messages.data;
+        if (bar) {
+          if (!this.data.bars.VIX) this.data.bars.VIX = [];
+          this.data.bars.VIX.unshift(bar);
+          if (this.data.bars.VIX.length > 500) this.data.bars.VIX.pop();
+          if (bar.close != null) this.data.VIX = { value: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
+          this.saveSession();
+          this.onDataUpdate?.('bar', 'VIX', bar);
         }
       }
     };

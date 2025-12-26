@@ -38,11 +38,21 @@ const server = http.createServer(app);
 
 // Latest snapshot cached in-memory (and served to new WS clients).
 const latest = {
-  status: { connected: false, authenticated: false },
+  status: {
+    connected: false,
+    authenticated: false,
+    lastMessageTs: null,
+    lastSPXTs: null,
+    lastVIXTs: null,
+    lastSPXBarTs: null,
+    lastVIXBarTs: null,
+    counters: { msgs: 0, spx: 0, vix: 0, spxBars: 0, vixBars: 0 },
+  },
   SPX: null,
   VIX: null,
   bars: {
     SPX: [], // newest-first, minute bars from AM.I:SPX
+    VIX: [], // newest-first, minute bars from AM.I:VIX (if available)
   },
 };
 
@@ -82,6 +92,7 @@ function requireToken(req, res) {
 }
 
 app.get('/health', (_req, res) => {
+  if (!requireToken(_req, res)) return;
   res.json({
     ok: true,
     hasKey: Boolean(API_KEY),
@@ -90,6 +101,11 @@ app.get('/health', (_req, res) => {
     connected: latest.status.connected,
     authenticated: latest.status.authenticated,
   });
+});
+
+app.get('/api/status', (req, res) => {
+  if (!requireToken(req, res)) return;
+  res.json({ ok: true, latest });
 });
 
 app.get('/api/prev', async (_req, res) => {
@@ -172,31 +188,41 @@ function connectUpstream() {
   }
 
   upstreamAuthed = false;
-  latest.status = { connected: false, authenticated: false };
+  latest.status.connected = false;
+  latest.status.authenticated = false;
+  latest.status.error = undefined;
   wsBroadcast(wss, { type: 'status', status: latest.status });
 
   upstream = new WebSocket(WS_INDICES_URL);
 
   upstream.on('open', () => {
-    latest.status = { connected: true, authenticated: false };
+    latest.status.connected = true;
+    latest.status.authenticated = false;
+    latest.status.error = undefined;
     wsBroadcast(wss, { type: 'status', status: latest.status });
     upstream.send(JSON.stringify({ action: 'auth', params: API_KEY }));
   });
 
   upstream.on('message', (buf) => {
+    latest.status.lastMessageTs = Date.now();
     const messages = safeJsonParse(buf.toString());
     if (!messages) return;
     const list = Array.isArray(messages) ? messages : [messages];
 
     for (const msg of list) {
+      latest.status.counters.msgs += 1;
       if (msg?.ev === 'status') {
         if (msg.status === 'auth_success') {
           upstreamAuthed = true;
-          latest.status = { connected: true, authenticated: true };
+          latest.status.connected = true;
+          latest.status.authenticated = true;
+          latest.status.error = undefined;
           wsBroadcast(wss, { type: 'status', status: latest.status });
           upstream.send(JSON.stringify({ action: 'subscribe', params: 'V.I:SPX,V.I:VIX,AM.I:SPX,AM.I:VIX' }));
         } else if (msg.status === 'auth_failed') {
-          latest.status = { connected: false, authenticated: false, error: msg.message || 'auth_failed' };
+          latest.status.connected = false;
+          latest.status.authenticated = false;
+          latest.status.error = msg.message || 'auth_failed';
           wsBroadcast(wss, { type: 'status', status: latest.status });
         }
         continue;
@@ -209,9 +235,13 @@ function connectUpstream() {
         const val = Number(msg.val ?? msg.v);
         const ts = msg.t || Date.now();
         if (sym === 'SPX') {
+          latest.status.lastSPXTs = ts;
+          latest.status.counters.spx += 1;
           latest.SPX = { price: val, timestamp: ts, source: 'WS_V' };
           wsBroadcast(wss, { type: 'SPX', data: latest.SPX });
         } else if (sym === 'VIX') {
+          latest.status.lastVIXTs = ts;
+          latest.status.counters.vix += 1;
           latest.VIX = { value: val, timestamp: ts, source: 'WS_V' };
           wsBroadcast(wss, { type: 'VIX', data: latest.VIX });
         }
@@ -221,7 +251,7 @@ function connectUpstream() {
       // Aggregate minute bars (real bars)
       if (msg?.ev === 'AM') {
         const sym = String(msg.sym || msg.T || '').replace('I:', '');
-        if (sym !== 'SPX') continue;
+        if (sym !== 'SPX' && sym !== 'VIX') continue;
 
         const bar = {
           timestamp: msg.s || Date.now(),
@@ -233,25 +263,39 @@ function connectUpstream() {
           source: 'WS_AM',
         };
 
-        latest.bars.SPX.unshift(bar);
-        if (latest.bars.SPX.length > 500) latest.bars.SPX.pop();
-
-        // Keep spot synced from close
-        latest.SPX = { price: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
-        wsBroadcast(wss, { type: 'SPX', data: latest.SPX });
-        wsBroadcast(wss, { type: 'SPX_BAR', data: bar });
+        if (sym === 'SPX') {
+          latest.status.lastSPXBarTs = bar.timestamp;
+          latest.status.counters.spxBars += 1;
+          latest.bars.SPX.unshift(bar);
+          if (latest.bars.SPX.length > 500) latest.bars.SPX.pop();
+          latest.SPX = { price: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
+          wsBroadcast(wss, { type: 'SPX', data: latest.SPX });
+          wsBroadcast(wss, { type: 'SPX_BAR', data: bar });
+        } else {
+          latest.status.lastVIXBarTs = bar.timestamp;
+          latest.status.counters.vixBars += 1;
+          latest.bars.VIX.unshift(bar);
+          if (latest.bars.VIX.length > 500) latest.bars.VIX.pop();
+          latest.VIX = { value: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
+          wsBroadcast(wss, { type: 'VIX', data: latest.VIX });
+          wsBroadcast(wss, { type: 'VIX_BAR', data: bar });
+        }
       }
     }
   });
 
   upstream.on('close', () => {
-    latest.status = { connected: false, authenticated: false, error: 'closed' };
+    latest.status.connected = false;
+    latest.status.authenticated = false;
+    latest.status.error = 'closed';
     wsBroadcast(wss, { type: 'status', status: latest.status });
     scheduleReconnect();
   });
 
   upstream.on('error', () => {
-    latest.status = { connected: false, authenticated: false, error: 'error' };
+    latest.status.connected = false;
+    latest.status.authenticated = false;
+    latest.status.error = 'error';
     wsBroadcast(wss, { type: 'status', status: latest.status });
     scheduleReconnect();
   });

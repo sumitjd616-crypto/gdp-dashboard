@@ -3,6 +3,7 @@ import massiveService from './services/MassiveService';
 import { buildGEXProfile, buildWeeklyAnalysis } from './services/GEXCalculator';
 
 const STORAGE_KEY = 'titan_omega_session_v1';
+const PROXY_TOKEN = import.meta.env.VITE_PROXY_TOKEN || '';
 
 function formatETTime(date) {
   try {
@@ -41,6 +42,13 @@ export default function TitanOmegaDashboard() {
   const [vix, setVix] = useState(null);
   const [dailyBars, setDailyBars] = useState([]);
   const [spxBars, setSpxBars] = useState([]);
+  const [dataStatus, setDataStatus] = useState({
+    ws: { connected: false, authenticated: false, error: null },
+    lastSPXTs: null,
+    lastVIXTs: null,
+    lastSPXBarTs: null,
+    lastVIXBarTs: null,
+  });
 
   // Load cached session (after-hours persistence)
   useEffect(() => {
@@ -96,10 +104,8 @@ export default function TitanOmegaDashboard() {
 
       // Weekly analysis uses daily bars from backend proxy
       try {
-        const dailyRes = await fetch('/api/daily?days=10');
-        const dailyJson = await dailyRes.json();
-        if (!dailyRes.ok || !dailyJson?.ok) throw new Error(dailyJson?.error || 'daily fetch failed');
-        setDailyBars(Array.isArray(dailyJson.bars) ? dailyJson.bars : []);
+        const bars = await massiveService.fetchDailyBars(10);
+        setDailyBars(bars);
       } catch (e) {
         // Not fatal; dashboard still runs.
         setDailyBars((prev) => prev || []);
@@ -123,6 +129,41 @@ export default function TitanOmegaDashboard() {
 
   const heatmap = gex?.heatmap || [];
   const maxTouches = useMemo(() => Math.max(1, ...heatmap.map((h) => Number(h.touches || 0))), [heatmap]);
+
+  // Data health polling (real-time status only; no mock)
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/status', { headers: PROXY_TOKEN ? { 'x-titan-token': PROXY_TOKEN } : {} });
+        const json = await res.json();
+        if (!res.ok || !json?.ok) return;
+        const st = json.latest?.status || {};
+        if (cancelled) return;
+        setDataStatus({
+          ws: { connected: Boolean(st.connected), authenticated: Boolean(st.authenticated), error: st.error || null },
+          lastSPXTs: st.lastSPXTs || null,
+          lastVIXTs: st.lastVIXTs || null,
+          lastSPXBarTs: st.lastSPXBarTs || null,
+          lastVIXBarTs: st.lastVIXBarTs || null,
+        });
+      } catch {
+        // ignore
+      }
+    };
+    poll();
+    const t = setInterval(poll, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
+
+  const nowMs = time.getTime();
+  const ageSec = (ts) => (ts ? Math.max(0, Math.floor((nowMs - Number(ts)) / 1000)) : null);
+  const spxAge = ageSec(dataStatus.lastSPXTs);
+  const vixAge = ageSec(dataStatus.lastVIXTs);
+  const spxBarAge = ageSec(dataStatus.lastSPXBarTs);
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 font-sans">
@@ -175,6 +216,34 @@ export default function TitanOmegaDashboard() {
             {error && <div className="mt-2 text-xs text-red-300">Error: {error}</div>}
             <div className="mt-2 text-xs text-gray-500">
               Keys are stored server-side. Set <code className="font-mono">MASSIVE_API_KEY</code> in <code className="font-mono">titan-omega-dashboard/.env</code>.
+            </div>
+          </div>
+
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-sm font-semibold text-gray-300">Data health (real-time)</div>
+              <Badge color={dataStatus.ws.authenticated ? 'green' : 'yellow'}>
+                {dataStatus.ws.authenticated ? 'UPSTREAM_AUTH' : dataStatus.ws.connected ? 'UPSTREAM_CONN' : 'DOWN'}
+              </Badge>
+            </div>
+            {dataStatus.ws.error && <div className="text-xs text-red-300 mb-2">Upstream: {dataStatus.ws.error}</div>}
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                <div className="text-gray-500">SPX tick age</div>
+                <div className="font-mono font-bold">{spxAge == null ? '—' : `${spxAge}s`}</div>
+              </div>
+              <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                <div className="text-gray-500">VIX tick age</div>
+                <div className="font-mono font-bold">{vixAge == null ? '—' : `${vixAge}s`}</div>
+              </div>
+              <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                <div className="text-gray-500">SPX bar age</div>
+                <div className="font-mono font-bold">{spxBarAge == null ? '—' : `${spxBarAge}s`}</div>
+              </div>
+              <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                <div className="text-gray-500">SPX bars cached</div>
+                <div className="font-mono font-bold">{spxBars.length}</div>
+              </div>
             </div>
           </div>
 
