@@ -15,10 +15,14 @@ import { WebSocket, WebSocketServer } from 'ws';
  * - MASSIVE_API_KEY (recommended)
  * - VITE_POLYGON_API_KEY or VITE_MASSIVE_API_KEY (fallback for local dev only)
  * - MASSIVE_WS_INDICES_URL (optional; defaults to Polygon indices socket)
+ * - PROXY_TOKEN (optional). If set:
+ *   - REST requires header: `x-titan-token: <token>`
+ *   - WS requires query param: `/stream?token=<token>`
  * - PORT (default 8787)
  */
 
 const PORT = Number(process.env.PORT || 8787);
+const PROXY_TOKEN = process.env.PROXY_TOKEN || '';
 const API_KEY =
   process.env.MASSIVE_API_KEY ||
   process.env.POLYGON_API_KEY ||
@@ -37,6 +41,9 @@ const latest = {
   status: { connected: false, authenticated: false },
   SPX: null,
   VIX: null,
+  bars: {
+    SPX: [], // newest-first, minute bars from AM.I:SPX
+  },
 };
 
 function safeJsonParse(s) {
@@ -66,10 +73,19 @@ async function fetchJson(url) {
   return data;
 }
 
+function requireToken(req, res) {
+  if (!PROXY_TOKEN) return true;
+  const tok = req.headers['x-titan-token'];
+  if (tok && String(tok) === PROXY_TOKEN) return true;
+  res.status(401).json({ ok: false, error: 'Unauthorized' });
+  return false;
+}
+
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     hasKey: Boolean(API_KEY),
+    tokenProtected: Boolean(PROXY_TOKEN),
     wsUrl: WS_INDICES_URL,
     connected: latest.status.connected,
     authenticated: latest.status.authenticated,
@@ -77,6 +93,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.get('/api/prev', async (_req, res) => {
+  if (!requireToken(_req, res)) return;
   if (!API_KEY) return res.status(400).json({ ok: false, error: 'Missing server API key (set MASSIVE_API_KEY)' });
   try {
     const [spx, vix] = await Promise.all([
@@ -94,6 +111,7 @@ app.get('/api/prev', async (_req, res) => {
 });
 
 app.get('/api/daily', async (req, res) => {
+  if (!requireToken(req, res)) return;
   if (!API_KEY) return res.status(400).json({ ok: false, error: 'Missing server API key (set MASSIVE_API_KEY)' });
   const days = Math.max(5, Math.min(90, Number(req.query.days || 10)));
   const to = new Date().toISOString().slice(0, 10);
@@ -121,7 +139,15 @@ app.get('/api/daily', async (req, res) => {
 
 // WebSocket server for frontend clients
 const wss = new WebSocketServer({ server, path: '/stream' });
-wss.on('connection', (socket) => {
+wss.on('connection', (socket, req) => {
+  if (PROXY_TOKEN) {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const tok = url.searchParams.get('token') || '';
+    if (tok !== PROXY_TOKEN) {
+      socket.close(1008, 'Unauthorized');
+      return;
+    }
+  }
   // Send current snapshot immediately
   socket.send(JSON.stringify({ type: 'snapshot', data: latest }));
 });
@@ -189,6 +215,31 @@ function connectUpstream() {
           latest.VIX = { value: val, timestamp: ts, source: 'WS_V' };
           wsBroadcast(wss, { type: 'VIX', data: latest.VIX });
         }
+        continue;
+      }
+
+      // Aggregate minute bars (real bars)
+      if (msg?.ev === 'AM') {
+        const sym = String(msg.sym || msg.T || '').replace('I:', '');
+        if (sym !== 'SPX') continue;
+
+        const bar = {
+          timestamp: msg.s || Date.now(),
+          open: msg.o,
+          high: msg.h,
+          low: msg.l,
+          close: msg.c,
+          volume: msg.v,
+          source: 'WS_AM',
+        };
+
+        latest.bars.SPX.unshift(bar);
+        if (latest.bars.SPX.length > 500) latest.bars.SPX.pop();
+
+        // Keep spot synced from close
+        latest.SPX = { price: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
+        wsBroadcast(wss, { type: 'SPX', data: latest.SPX });
+        wsBroadcast(wss, { type: 'SPX_BAR', data: bar });
       }
     }
   });

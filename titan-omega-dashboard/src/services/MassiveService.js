@@ -9,6 +9,7 @@
  */
 
 const STORAGE_KEY = 'titan_omega_session_v1';
+const PROXY_TOKEN = import.meta.env.VITE_PROXY_TOKEN || '';
 
 function safeJsonParse(s) {
   try {
@@ -111,7 +112,9 @@ class MassiveService {
   }
 
   async fetchPreviousDayData() {
-    const res = await fetch('/api/prev');
+    const res = await fetch('/api/prev', {
+      headers: PROXY_TOKEN ? { 'x-titan-token': PROXY_TOKEN } : {},
+    });
     const json = await res.json();
     if (!res.ok || !json?.ok) throw new Error(json?.error || 'REST /api/prev failed');
 
@@ -148,7 +151,8 @@ class MassiveService {
     this.disconnectAll();
 
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const endpoint = `${proto}://${window.location.host}/stream`;
+    const endpoint =
+      PROXY_TOKEN ? `${proto}://${window.location.host}/stream?token=${encodeURIComponent(PROXY_TOKEN)}` : `${proto}://${window.location.host}/stream`;
     const ws = new WebSocket(endpoint);
     this.ws = ws;
 
@@ -171,6 +175,7 @@ class MassiveService {
         const snap = messages.data || {};
         if (snap.SPX) this.data.SPX = snap.SPX;
         if (snap.VIX) this.data.VIX = snap.VIX;
+        if (snap.bars?.SPX && Array.isArray(snap.bars.SPX)) this.data.bars.SPX = snap.bars.SPX;
         if (snap.status) {
           this.connected.indices = Boolean(snap.status.connected);
           this.authenticated.indices = Boolean(snap.status.authenticated);
@@ -199,6 +204,19 @@ class MassiveService {
         this.data.VIX = { ...messages.data, source: messages.data?.source || 'WS_PROXY' };
         this.saveSession();
         this.onDataUpdate?.('index', 'VIX', this.data);
+        return;
+      }
+
+      if (messages.type === 'SPX_BAR') {
+        const bar = messages.data;
+        if (bar) {
+          this.data.bars.SPX.unshift(bar);
+          if (this.data.bars.SPX.length > 500) this.data.bars.SPX.pop();
+          // keep spot synced from close
+          if (bar.close != null) this.data.SPX = { price: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
+          this.saveSession();
+          this.onDataUpdate?.('bar', 'SPX', bar);
+        }
       }
     };
 

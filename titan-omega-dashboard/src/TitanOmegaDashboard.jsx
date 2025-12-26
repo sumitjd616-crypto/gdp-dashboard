@@ -40,6 +40,7 @@ export default function TitanOmegaDashboard() {
   const [spx, setSpx] = useState(null);
   const [vix, setVix] = useState(null);
   const [dailyBars, setDailyBars] = useState([]);
+  const [spxBars, setSpxBars] = useState([]);
 
   // Load cached session (after-hours persistence)
   useEffect(() => {
@@ -82,6 +83,7 @@ export default function TitanOmegaDashboard() {
         const data = massiveService.getData();
         if (data?.SPX) setSpx(data.SPX);
         if (data?.VIX) setVix(data.VIX);
+        if (data?.bars?.SPX && Array.isArray(data.bars.SPX)) setSpxBars(data.bars.SPX);
       },
     });
 
@@ -113,11 +115,14 @@ export default function TitanOmegaDashboard() {
   const spot = spx?.price ? Number(spx.price) : null;
   const vixVal = vix?.value ? Number(vix.value) : null;
 
-  const gex = useMemo(() => (spot ? buildGEXProfile(spot, null, vixVal || 15) : null), [spot, vixVal]);
+  const gex = useMemo(() => {
+    if (!spot || !spxBars.length) return null;
+    return buildGEXProfile(spot, spxBars, vixVal || null);
+  }, [spot, spxBars, vixVal]);
   const weekly = useMemo(() => (gex && dailyBars.length ? buildWeeklyAnalysis(gex, dailyBars) : null), [dailyBars, gex]);
 
   const heatmap = gex?.heatmap || [];
-  const maxAbs = useMemo(() => Math.max(1, ...heatmap.map((h) => Math.abs(h.gex))), [heatmap]);
+  const maxTouches = useMemo(() => Math.max(1, ...heatmap.map((h) => Number(h.touches || 0))), [heatmap]);
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 font-sans">
@@ -128,7 +133,7 @@ export default function TitanOmegaDashboard() {
             <div>
               <div className="text-lg font-bold">TITAN OMEGA</div>
               <div className="text-xs text-gray-500">
-                {status?.mode === 'WS_LIVE' ? '🟢 LIVE STREAM' : '🟡 REST / CACHED'} · GEX: MODEL
+                {status?.mode === 'WS_LIVE' ? '🟢 LIVE STREAM' : '🟡 REST / CACHED'} · LEVELS: REAL-TIME
               </div>
             </div>
           </div>
@@ -201,17 +206,16 @@ export default function TitanOmegaDashboard() {
         <section className="col-span-12 lg:col-span-8 space-y-3">
           <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
             <div className="px-4 py-3 bg-gray-800/40 border-b border-gray-800 flex items-center justify-between">
-              <div className="text-sm font-semibold text-gray-300">GEX Heatmap (Model)</div>
+              <div className="text-sm font-semibold text-gray-300">Level Heatmap (Real touches)</div>
               <div className="flex gap-2 text-xs">
-                <span className="text-emerald-400">■ Support (+GEX)</span>
-                <span className="text-red-400">■ Resistance (-GEX)</span>
+                <span className="text-emerald-400">■ Support</span>
+                <span className="text-red-400">■ Resistance</span>
               </div>
             </div>
             <div className="p-3 max-h-[520px] overflow-y-auto space-y-1">
-              {heatmap.length === 0 && <div className="text-sm text-gray-500">Waiting for price…</div>}
+              {heatmap.length === 0 && <div className="text-sm text-gray-500">Waiting for real bars…</div>}
               {heatmap.map((h) => {
-                const w = Math.min(100, (Math.abs(h.gex) / maxAbs) * 100);
-                const pos = h.gex >= 0;
+                const w = Math.min(100, (Number(h.touches || 0) / maxTouches) * 100);
                 const isSpot = spot != null && Math.abs(h.strike - spot) < 2.5;
                 const isFlip = gex && Math.abs(h.strike - gex.gammaFlip) < 2.5;
                 const isCall = gex && h.strike === gex.callWall;
@@ -241,16 +245,17 @@ export default function TitanOmegaDashboard() {
                     <div className="flex-1 h-4 relative">
                       <div className="absolute left-1/2 w-px h-full bg-gray-700" />
                       <div className="w-full flex justify-center">
-                        {pos ? (
+                        {h.kind === 'SUPPORT' ? (
                           <div className="h-3 bg-emerald-500 rounded-sm" style={{ width: `${w}%`, marginLeft: '50%' }} />
-                        ) : (
+                        ) : h.kind === 'RESISTANCE' ? (
                           <div className="h-3 bg-red-500 rounded-sm" style={{ width: `${w}%`, marginRight: '50%' }} />
+                        ) : (
+                          <div className="h-3 bg-gray-500 rounded-sm" style={{ width: `${w}%`, marginLeft: '50%' }} />
                         )}
                       </div>
                     </div>
-                    <div className={`w-16 text-right font-mono text-xs ${pos ? 'text-emerald-400' : 'text-red-400'}`}>
-                      {pos ? '+' : ''}
-                      {h.gex.toFixed(0)}
+                    <div className="w-16 text-right font-mono text-xs text-gray-300">
+                      {Number(h.touches || 0)}
                     </div>
                   </div>
                 );

@@ -1,65 +1,107 @@
 /**
- * Model-based GEX Calculator
+ * Real-time ONLY levels calculator (no synthetic/mock data)
  *
- * Real options GEX needs full options-chain + greeks subscription.
- * This module provides a model proxy that is stable and useful for levels.
+ * We do NOT compute true options-chain GEX here.
+ * Instead, we derive actionable “walls/flip” from real SPX minute bars:
+ * - gammaFlip: midpoint of last 20-bar range (real price action)
+ * - callWall: most-touched resistance level above spot (real touches)
+ * - putWall:  most-touched support level below spot (real touches)
+ *
+ * Output includes a “heatmap” that is **touch-count based** (real data),
+ * not synthetic GEX numbers.
  */
 
-function roundTo(x, step) {
-  return Math.round(x / step) * step;
+function roundTo5(x) {
+  return Math.round(x / 5) * 5;
 }
 
-function clamp(x, a, b) {
-  return Math.max(a, Math.min(b, x));
+function calculateATR(bars, period = 14) {
+  if (!bars || bars.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < bars.length; i += 1) {
+    const hi = bars[i].high;
+    const lo = bars[i].low;
+    const pc = bars[i - 1].close;
+    const tr = Math.max(hi - lo, Math.abs(hi - pc), Math.abs(lo - pc));
+    trs.push(tr);
+  }
+  const tail = trs.slice(-period);
+  return tail.reduce((a, b) => a + b, 0) / tail.length;
 }
 
-export function buildGEXProfile(spot, _optionsChain = null, vix = 15) {
-  const iv = (Number(vix) || 15) / 100;
-  const roundedSpot = roundTo(spot, 5);
-  const strikeStep = 5;
-  const n = 44;
+function buildTouchMap(bars, spot, windowBars = 200) {
+  const recent = bars.slice(0, windowBars); // bars are newest-first
+  const touch = new Map(); // strike -> count
 
-  const volPts = clamp(spot * iv * Math.sqrt(1 / 252), 12, 80);
-  const gammaFlip = roundTo(spot, 5); // stable reference (avoid jitter)
-  const callWall = roundTo(spot + volPts * 1.2, 5);
-  const putWall = roundTo(spot - volPts * 1.2, 5);
+  const tol = 2.5; // half of 5pt increment
+  const addTouch = (price) => {
+    const s = roundTo5(price);
+    const k = String(s);
+    touch.set(k, (touch.get(k) || 0) + 1);
+  };
 
-  const heatmap = [];
-  let netGEX = 0;
-
-  for (let i = -n; i <= n; i += 1) {
-    const strike = roundedSpot + i * strikeStep;
-    const dist = Math.abs(strike - spot);
-    const stepsAway = Math.abs(i);
-
-    const roundBonus = strike % 50 === 0 ? 2.5 : strike % 25 === 0 ? 1.6 : 1;
-    const atmDecay = Math.exp(-0.085 * stepsAway);
-    const direction = strike >= spot ? -1 : 1;
-    const wallBoost = Math.exp(-dist / Math.max(8, volPts * 0.5));
-    const gex = direction * 100 * roundBonus * atmDecay * (0.6 + 0.7 * wallBoost);
-
-    heatmap.push({ strike, gex });
-    netGEX += gex;
+  for (const b of recent) {
+    if (!b) continue;
+    // count touches near high/low/close (real)
+    if (typeof b.high === 'number') addTouch(b.high);
+    if (typeof b.low === 'number') addTouch(b.low);
+    if (typeof b.close === 'number') addTouch(b.close);
   }
 
-  const regime = netGEX >= 0 ? 'POSITIVE' : 'NEGATIVE';
+  // Build ladder around spot
+  const center = roundTo5(spot);
+  const ladder = [];
+  for (let s = center + 100; s >= center - 100; s -= 5) {
+    const count = touch.get(String(s)) || 0;
+    const kind = s > spot + tol ? 'RESISTANCE' : s < spot - tol ? 'SUPPORT' : 'NEUTRAL';
+    ladder.push({ strike: s, touches: count, kind });
+  }
+  return ladder;
+}
+
+function pickWall(levels, dir) {
+  // dir: 'UP' -> resistance, 'DOWN' -> support
+  const filtered =
+    dir === 'UP' ? levels.filter((l) => l.kind === 'RESISTANCE') : levels.filter((l) => l.kind === 'SUPPORT');
+  filtered.sort((a, b) => b.touches - a.touches);
+  return filtered[0]?.strike ?? null;
+}
+
+export function buildGEXProfile(spot, bars = [], vix = null) {
+  if (!spot || !Array.isArray(bars) || bars.length === 0) {
+    return { available: false, reason: 'Need real spot + real bars' };
+  }
+
+  // gammaFlip from real consolidation midpoint (last 20 bars)
+  const last20 = bars.slice(0, 20);
+  const hi = Math.max(...last20.map((b) => b.high).filter((x) => typeof x === 'number'));
+  const lo = Math.min(...last20.map((b) => b.low).filter((x) => typeof x === 'number'));
+  const gammaFlip = roundTo5((hi + lo) / 2);
+
+  const heatmap = buildTouchMap(bars, spot, 250);
+  const callWall = pickWall(heatmap, 'UP') ?? roundTo5(spot + 25);
+  const putWall = pickWall(heatmap, 'DOWN') ?? roundTo5(spot - 25);
+
+  const atr = calculateATR([...bars].reverse(), 14); // ATR expects oldest->newest
+  const regime = spot >= gammaFlip ? 'POSITIVE' : 'NEGATIVE';
 
   return {
     available: true,
-    dataSource: 'MODEL',
+    dataSource: 'REAL_BARS',
     spot,
+    vix: vix ?? null,
     timestamp: new Date(),
     gammaFlip,
     callWall,
     putWall,
-    netGEX,
-    regime,
-    heatmap,
+    atr,
+    heatmap, // [{ strike, touches, kind }]
     analysis: {
       aboveGammaFlip: spot > gammaFlip,
       nearCallWall: Math.abs(spot - callWall) < 10,
       nearPutWall: Math.abs(spot - putWall) < 10,
     },
+    regime,
   };
 }
 
