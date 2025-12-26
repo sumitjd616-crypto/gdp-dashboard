@@ -182,6 +182,16 @@
               <span style="text-transform:uppercase; letter-spacing:0.10em;">Gamma Walls (proxy)</span>:
               <span class="mono" id="gammaWallsTop3">N/A</span>
             </div>
+            <div class="muted" style="margin-top:6px;">
+              <span style="text-transform:uppercase; letter-spacing:0.10em;">Mood</span>:
+              <span class="mono" id="mood">N/A</span>
+              &nbsp;|&nbsp;
+              <span style="text-transform:uppercase; letter-spacing:0.10em;">Bias</span>:
+              <span class="mono" id="tradeBias">N/A</span>
+              &nbsp;|&nbsp;
+              <span style="text-transform:uppercase; letter-spacing:0.10em;">Trade Conf</span>:
+              <span class="mono" id="tradeConf">N/A</span>
+            </div>
             <ul class="why" id="whyList"></ul>
             <div style="height:10px;"></div>
             <div class="row">
@@ -260,6 +270,18 @@
           <span style="text-transform:uppercase; letter-spacing:0.10em;">Gamma Walls (proxy)</span>:
           <span class="mono" id="drawerGammaWalls">N/A</span>
         </div>
+        <div class="muted" style="margin-top:8px;">
+          <span style="text-transform:uppercase; letter-spacing:0.10em;">Mood</span>:
+          <span class="mono" id="drawerMood">N/A</span>
+          &nbsp;|&nbsp;
+          <span style="text-transform:uppercase; letter-spacing:0.10em;">Bias</span>:
+          <span class="mono" id="drawerBias">N/A</span>
+          &nbsp;|&nbsp;
+          <span style="text-transform:uppercase; letter-spacing:0.10em;">Trade Conf</span>:
+          <span class="mono" id="drawerTradeConf">N/A</span>
+        </div>
+        <div class="muted" style="margin-top:8px; text-transform:uppercase; letter-spacing:0.10em;">Trade logic</div>
+        <ul class="why" id="drawerLogic"></ul>
         <ul class="why" id="drawerWhy"></ul>
       </div>
     </div>
@@ -441,6 +463,17 @@
         // Gamma walls from archive payload (levels_json stored in SQLite)
         const walls = a.levels?.gamma_walls || null;
         $("drawerGammaWalls").innerText = fmtGammaWallsTop3(walls);
+        $("drawerMood").innerText = a.mood || "N/A";
+        $("drawerBias").innerText = a.trade_bias || "N/A";
+        $("drawerTradeConf").innerText = (a.trade_confidence !== null && a.trade_confidence !== undefined) ? `${a.trade_confidence}` : "N/A";
+
+        const logicUl = $("drawerLogic");
+        logicUl.innerHTML = "";
+        for (const w of (a.trade_logic || [])) {
+          const li = document.createElement("li");
+          li.innerText = w;
+          logicUl.appendChild(li);
+        }
         const ul = $("drawerWhy");
         ul.innerHTML = "";
         for (const w of (a.why || [])) {
@@ -574,6 +607,9 @@
         setRegimeUI(p.regime || "NEUTRAL", p.trigger_text, p.why || []);
         $("scenarioText").innerText = p.scenario ? `Most likely scenario: ${p.scenario}` : "Most likely scenario: N/A";
         $("gammaWallsTop3").innerText = fmtGammaWallsTop3(p.gamma_walls);
+        $("mood").innerText = p.mood || "N/A";
+        $("tradeBias").innerText = p.trade_bias || "N/A";
+        $("tradeConf").innerText = (p.trade_confidence !== null && p.trade_confidence !== undefined) ? `${p.trade_confidence}` : "N/A";
         // Proxy labeling + coverage/confidence (never imply true dealer book)
         const cov = p.coverage || null;
         const covGreeks = (cov && cov.coverage_greeks !== null && cov.coverage_greeks !== undefined) ? (100*cov.coverage_greeks).toFixed(0) + "%" : "N/A";

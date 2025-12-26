@@ -67,6 +67,11 @@ GLOBAL_STATE: Dict[str, Any] = {
     "trigger_text": "NEUTRAL: Wait for structure.",
     "why": [],
     "scenario": None,
+    # Weighted sync output (model-based, Polygon inputs only)
+    "mood": None,  # TREND | VOL_EXPANSION | MEAN_REVERT | CHOP | UNKNOWN
+    "trade_bias": None,  # UP | DOWN | MEAN_REVERT | WAIT | None
+    "trade_confidence": None,  # 0-100 (signal alignment confidence, NOT data coverage)
+    "trade_logic": None,  # list[str] concise breakdown
     "last_alert_id": None,
     # For UI charts
     "spot_series": [],  # list[{ts_ms, price}]
@@ -141,6 +146,10 @@ def migrate_sqlite(db_path: str) -> None:
               why_json TEXT,
               levels_json TEXT,
               coverage_json TEXT,
+              mood TEXT,
+              trade_bias TEXT,
+              trade_confidence REAL,
+              trade_logic_json TEXT,
               spot REAL,
               net_gex REAL,
               net_vex REAL,
@@ -172,6 +181,22 @@ def migrate_sqlite(db_path: str) -> None:
             pass
         try:
             conn.execute("ALTER TABLE alerts ADD COLUMN coverage_json TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN mood TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN trade_bias TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN trade_confidence REAL;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN trade_logic_json TEXT;")
         except Exception:
             pass
         try:
@@ -611,9 +636,10 @@ def insert_alert(db_path: str, payload: Dict[str, Any]) -> int:
             """
             INSERT INTO alerts (
               ts, regime, message, trigger_text, scenario, confidence, why_json, levels_json, coverage_json,
+              mood, trade_bias, trade_confidence, trade_logic_json,
               spot, net_gex, net_vex, net_cex, net_delta,
               d_gex, d_delta, gamma_flip, net_vanna, net_charm, vol_short, vol_long, vol_rising
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 payload["ts"],
@@ -625,6 +651,10 @@ def insert_alert(db_path: str, payload: Dict[str, Any]) -> int:
                 json.dumps(payload.get("why") or []),
                 json.dumps(payload.get("levels") or {}),
                 json.dumps(payload.get("coverage") or {}),
+                payload.get("mood"),
+                payload.get("trade_bias"),
+                payload.get("trade_confidence"),
+                json.dumps(payload.get("trade_logic") or []),
                 payload.get("spot"),
                 payload.get("net_gex"),
                 payload.get("net_vex"),
@@ -652,6 +682,7 @@ def fetch_alerts(db_path: str, limit: int) -> List[Dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT id, ts, regime, message, trigger_text, scenario, confidence, why_json, levels_json, coverage_json,
+                   mood, trade_bias, trade_confidence, trade_logic_json,
                    gamma_flip, net_vanna, net_charm, spot
             FROM alerts
             ORDER BY id DESC
@@ -673,6 +704,10 @@ def fetch_alerts(db_path: str, limit: int) -> List[Dict[str, Any]]:
                     "why": json.loads(r["why_json"] or "[]"),
                     "levels": json.loads(r["levels_json"] or "{}"),
                     "coverage": json.loads(r["coverage_json"] or "{}"),
+                    "mood": r["mood"],
+                    "trade_bias": r["trade_bias"],
+                    "trade_confidence": r["trade_confidence"],
+                    "trade_logic": json.loads(r["trade_logic_json"] or "[]"),
                     "gamma_flip": r["gamma_flip"],
                     "net_vanna": r["net_vanna"],
                     "net_charm": r["net_charm"],
@@ -734,6 +769,151 @@ def compute_stats(db_path: str) -> Dict[str, Any]:
         return stats
     finally:
         conn.close()
+
+
+def _pct(x: float) -> float:
+    return 100.0 * x
+
+
+def compute_market_mood_and_trade(
+    *,
+    spot: Optional[float],
+    spot_valid: bool,
+    vol_rising: Optional[bool],
+    net_gex: Optional[float],
+    d_delta: Optional[float],
+    d_delta_thr: Optional[float],
+    spot_stall: Optional[bool],
+    levels: Dict[str, Any],
+    data_confidence: Optional[str],
+) -> Tuple[Optional[str], Optional[str], Optional[float], List[str]]:
+    """
+    Polygon-only weighted sync model:
+    - Inputs: spot, vol regime, d_delta accel, gamma sign, gamma walls proximity (+ optional stall).
+    - Output: mood + trade bias + trade confidence + transparent reasoning bullets.
+
+    NOTE:
+    - data_confidence is coverage quality (HIGH/MED/LOW).
+    - trade_confidence is signal alignment confidence (0-100), capped by data_confidence.
+    """
+    if spot is None or not spot_valid:
+        return "UNKNOWN", None, None, ["N/A: spot invalid or missing"]
+
+    logic: List[str] = []
+
+    # Mood: classic microstructure proxy using vol regime + gamma sign.
+    if vol_rising is True:
+        mood = "TREND" if (net_gex is None or net_gex < 0) else "VOL_EXPANSION"
+    elif vol_rising is False:
+        mood = "MEAN_REVERT" if (net_gex is not None and net_gex > 0) else "CHOP"
+    else:
+        mood = "UNKNOWN"
+
+    # Weights adapt to mood (range/moods sync)
+    if mood in ("TREND", "VOL_EXPANSION"):
+        w_flow, w_gamma, w_levels, w_micro = 0.42, 0.25, 0.18, 0.15
+    elif mood == "MEAN_REVERT":
+        w_flow, w_gamma, w_levels, w_micro = 0.25, 0.35, 0.25, 0.15
+    else:
+        w_flow, w_gamma, w_levels, w_micro = 0.25, 0.25, 0.25, 0.25
+
+    # Flow acceleration strength (d_delta vs rolling threshold)
+    flow_strength = None
+    if d_delta is not None and d_delta_thr is not None and d_delta_thr > 0:
+        flow_strength = min(2.0, abs(d_delta) / float(d_delta_thr))  # 0..2
+        logic.append(f"Flow accel: abs(d_delta)/thr={flow_strength:.2f}x (thr=p90 rolling)")
+    else:
+        logic.append("Flow accel: N/A (insufficient d_delta history)")
+
+    # Gamma sign availability
+    gamma_present = net_gex is not None
+    if gamma_present:
+        logic.append(f"Gamma sign (proxy): {'+' if net_gex>0 else ('-' if net_gex<0 else '0')} (net_gex)")
+    else:
+        logic.append("Gamma sign (proxy): N/A (options greeks missing)")
+
+    # Gamma walls proximity (top-3)
+    levels_score = None
+    walls = (levels or {}).get("gamma_walls") or []
+    if isinstance(walls, list) and walls:
+        strikes: List[float] = []
+        for w in walls[:3]:
+            try:
+                strikes.append(float(w["strike"]))
+            except Exception:
+                pass
+        if strikes:
+            dist = min(abs(float(spot) - s) / max(1e-9, float(spot)) for s in strikes)
+            if dist <= 0.0025:
+                levels_score = 1.0
+            elif dist <= 0.0050:
+                levels_score = 0.6
+            else:
+                levels_score = 0.2
+            logic.append(f"Levels: near top gamma wall (dist={_pct(dist):.2f}%)")
+    if levels_score is None:
+        logic.append("Levels: N/A (gamma walls unavailable)")
+
+    # Microstructure confirmations
+    micro = 0.0
+    if vol_rising is True:
+        micro += 1.0
+        logic.append("Vol regime: rising (range expansion risk)")
+    elif vol_rising is False:
+        micro += 0.8
+        logic.append("Vol regime: not rising (range compression / mean reversion more likely)")
+    else:
+        logic.append("Vol regime: N/A")
+
+    if spot_stall is True:
+        micro += 0.5
+        logic.append("Spot: stalled (early pressure building)")
+
+    # Bias: directional when trend + negative gamma + flow sign; otherwise mean-revert/wait.
+    trade_bias: Optional[str]
+    if mood in ("TREND", "VOL_EXPANSION") and gamma_present and d_delta is not None:
+        if net_gex < 0 and d_delta < 0:
+            trade_bias = "DOWN"
+        elif net_gex < 0 and d_delta > 0:
+            trade_bias = "UP"
+        else:
+            trade_bias = "WAIT"
+    elif mood == "MEAN_REVERT":
+        trade_bias = "MEAN_REVERT"
+    else:
+        trade_bias = "WAIT"
+
+    # Build confidence from available features (no synthetic fill)
+    parts = []
+    if flow_strength is not None:
+        parts.append(w_flow * min(1.0, flow_strength / 2.0))
+    if gamma_present:
+        parts.append(w_gamma * 1.0)
+    if levels_score is not None:
+        parts.append(w_levels * levels_score)
+    if micro > 0:
+        parts.append(w_micro * min(1.0, micro / 1.5))
+
+    if not parts:
+        return mood, trade_bias, None, logic + ["Trade confidence: N/A (missing inputs)"]
+
+    raw = float(np.sum(np.asarray(parts, dtype=np.float64)))
+    raw = max(0.0, min(1.0, raw))
+
+    # Cap by data coverage confidence (still keep separate labels)
+    cap = 0.70
+    if data_confidence == "HIGH":
+        cap = 0.95
+    elif data_confidence == "MED":
+        cap = 0.85
+    elif data_confidence == "LOW":
+        cap = 0.75
+
+    conf = min(cap, raw)
+    trade_confidence = float(round(100.0 * conf, 1))
+    logic.append(f"Trade confidence: {trade_confidence:.1f}/100 (cap by data coverage={data_confidence or 'N/A'})")
+    logic.append(f"Trade bias: {trade_bias}")
+    return mood, trade_bias, trade_confidence, logic
 
 
 def outcomes_missing_for_alert(conn: sqlite3.Connection, alert_id: int, horizon: int) -> bool:
@@ -1057,6 +1237,22 @@ class TitanEngine:
                 stall, stall_frac = self._spot_stall(now_s, float(spot))
                 d_delta_thr = self._d_delta_threshold(now_s)
 
+                mood, trade_bias, trade_conf, trade_logic = compute_market_mood_and_trade(
+                    spot=float(spot),
+                    spot_valid=bool(GLOBAL_STATE["spot_valid"]),
+                    vol_rising=vol_rising,
+                    net_gex=exposures.get("net_gex"),
+                    d_delta=d_delta,
+                    d_delta_thr=d_delta_thr,
+                    spot_stall=stall,
+                    levels=levels,
+                    data_confidence=levels.get("confidence"),
+                )
+                GLOBAL_STATE["mood"] = mood
+                GLOBAL_STATE["trade_bias"] = trade_bias
+                GLOBAL_STATE["trade_confidence"] = trade_conf
+                GLOBAL_STATE["trade_logic"] = trade_logic
+
                 # Determine engine health
                 if not GLOBAL_STATE["spot_valid"]:
                     GLOBAL_STATE["engine_status"] = "DEGRADED"
@@ -1100,7 +1296,8 @@ class TitanEngine:
                 ):
                     regime = "PRE"
                     trigger_text = "STAY SHARP: Hedge pressure building."
-                    message = "HEDGE PRESSURE BUILDING: Delta hedging accelerating while spot stalls."
+                    direction = "UP" if d_delta > 0 else "DOWN"
+                    message = f"HEDGE PRESSURE BUILDING: Delta hedging accelerating while spot stalls ({direction} pressure)."
                     why = [
                         f"abs(d_delta)={abs(d_delta):.2f} > p{cfg.d_delta_percentile:.0f}={d_delta_thr:.2f}",
                         f"spot_stall=True (30s move={stall_frac:.5f})",
@@ -1171,6 +1368,9 @@ class TitanEngine:
                         "trigger_text": trigger_text,
                         "scenario": scenario,
                         "confidence": levels.get("confidence"),
+                        "mood": mood,
+                        "trade_bias": trade_bias,
+                        "trade_confidence": trade_conf,
                         "why": why,
                         "levels": {
                             "gamma_flip": levels.get("gamma_flip"),
@@ -1179,6 +1379,7 @@ class TitanEngine:
                             "net_charm": levels.get("net_charm"),
                         },
                         "coverage": levels.get("coverage"),
+                        "trade_logic": trade_logic,
                         "spot": float(spot),
                         "net_gex": exposures.get("net_gex"),
                         "net_vex": exposures.get("net_vex"),
@@ -1399,6 +1600,10 @@ def build_app(cfg: TitanConfig) -> FastAPI:
                     "last_alert_id": GLOBAL_STATE.get("last_alert_id"),
                     "why": GLOBAL_STATE.get("why") or [],
                     "scenario": GLOBAL_STATE.get("scenario"),
+                    "mood": GLOBAL_STATE.get("mood"),
+                    "trade_bias": GLOBAL_STATE.get("trade_bias"),
+                    "trade_confidence": GLOBAL_STATE.get("trade_confidence"),
+                    "trade_logic": GLOBAL_STATE.get("trade_logic") or [],
                     "proxy_label": GLOBAL_STATE.get("proxy_label"),
                     "coverage": GLOBAL_STATE.get("coverage"),
                     "confidence": GLOBAL_STATE.get("confidence"),
