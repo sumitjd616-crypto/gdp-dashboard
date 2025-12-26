@@ -1,2 +1,7 @@
 streamlit
 pandas
+numpy
+httpx
+fastapi
+uvicorn[standard]
+pytz

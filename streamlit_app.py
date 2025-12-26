@@ -1,151 +1,77 @@
+import os
+import threading
+
 import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
 
-# Set the title and favicon that appear in the Browser's tab bar.
+
 st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+    page_title="TITAN OMEGA v17.5 | Quant Terminal",
+    page_icon="📈",
+    layout="wide",
 )
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
-
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
+@st.cache_resource
+def _start_titan_backend() -> dict:
     """
+    Starts the FastAPI TITAN backend in-process (single GLOBAL_STATE lives in titan_server.py).
+    This avoids full Streamlit rerenders for live updates; the terminal UI runs in the browser.
+    """
+    port = int(os.getenv("TITAN_PORT", "8000"))
+    host = os.getenv("TITAN_HOST", "0.0.0.0")
+    started = False
+    err = None
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+    try:
+        # Import here so Streamlit UI can render even if POLYGON_API_KEY is missing.
+        import uvicorn
+        from titan_server import app  # requires POLYGON_API_KEY
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+        cfg = uvicorn.Config(app, host=host, port=port, log_level=os.getenv("TITAN_LOG_LEVEL", "info"))
+        server = uvicorn.Server(cfg)
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+        def _run():
+            try:
+                server.run()
+            except Exception:
+                pass
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        started = True
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
 
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
+    return {"started": started, "host": host, "port": port, "error": err}
 
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+st.markdown("### TITAN OMEGA v17.5 — Quant Terminal V2")
+st.caption("Polygon-only. Set `POLYGON_API_KEY` as an environment variable (no hardcoding).")
 
-st.header(f'GDP in {to_year}', divider='gray')
+backend = _start_titan_backend()
 
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
+if not backend["started"]:
+    st.error("Backend not running.")
+    st.code(
+        "\n".join(
+            [
+                "export POLYGON_API_KEY='...'",
+                "python -m uvicorn titan_server:app --host 0.0.0.0 --port 8000",
+            ]
         )
+    )
+    if backend["error"]:
+        st.caption(f"Startup error: {backend['error']}")
+    st.stop()
+
+port = backend["port"]
+
+cols = st.columns([1, 1, 3])
+with cols[0]:
+    st.metric("Backend", "RUNNING")
+with cols[1]:
+    st.metric("Port", str(port))
+with cols[2]:
+    st.markdown(f"Open terminal UI directly: `http://localhost:{port}/`")
+
+st.components.v1.iframe(f"http://localhost:{port}/", height=900, scrolling=True)
