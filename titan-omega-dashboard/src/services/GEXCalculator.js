@@ -1,11 +1,17 @@
 /**
- * GEX Calculator - Real-time Gamma Exposure Analysis
+ * GEX Calculator - REAL OPTIONS DATA ONLY
  * 
- * Calculates dealer positioning from REAL options data
- * Falls back to model-based estimates only when real data unavailable
+ * Calculates Gamma Exposure (GEX), Vanna, Charm from real options chain data.
+ * 
+ * NO MODEL-BASED ESTIMATES - NO SYNTHETIC DATA
+ * 
+ * If real options data is not available, returns unavailable status.
  */
 
-// Black-Scholes helpers
+// ═══════════════════════════════════════════════════════════════════════════════════
+// BLACK-SCHOLES GREEKS (For when Polygon doesn't provide Greeks)
+// ═══════════════════════════════════════════════════════════════════════════════════
+
 const normalCDF = (x) => {
   const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
   const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
@@ -18,435 +24,626 @@ const normalCDF = (x) => {
 
 const normalPDF = (x) => Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
 
-// Calculate option Greeks using Black-Scholes
-export const calculateGreeks = (S, K, T, r, sigma, isCall) => {
-  if (T <= 0) T = 1 / 365 / 24;
-  if (sigma <= 0) sigma = 0.15;
-  
-  const sqrtT = Math.sqrt(T);
-  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT);
-  const d2 = d1 - sigma * sqrtT;
-  const nd1 = normalPDF(d1);
+/**
+ * Calculate Black-Scholes Greeks
+ */
+export const calculateGreeks = (spot, strike, tte, iv, r = 0.05, type = 'call') => {
+  if (!spot || !strike || !tte || tte <= 0 || !iv || iv <= 0) {
+    return null;
+  }
 
-  return {
-    delta: isCall ? normalCDF(d1) : normalCDF(d1) - 1,
-    gamma: nd1 / (S * sigma * sqrtT),
-    vega: S * sqrtT * nd1 / 100,
-    theta: isCall
-      ? (-S * nd1 * sigma / (2 * sqrtT) - r * K * Math.exp(-r * T) * normalCDF(d2)) / 365
-      : (-S * nd1 * sigma / (2 * sqrtT) + r * K * Math.exp(-r * T) * (1 - normalCDF(d2))) / 365,
-    vanna: (nd1 / S) * (1 - d1 / (sigma * sqrtT)),
-    charm: -nd1 * (2 * r * T - d2 * sigma * sqrtT) / (2 * T * sigma * sqrtT),
-  };
+  const sqrtT = Math.sqrt(tte);
+  const d1 = (Math.log(spot / strike) + (r + 0.5 * iv * iv) * tte) / (iv * sqrtT);
+  const d2 = d1 - iv * sqrtT;
+
+  const nd1 = normalCDF(d1);
+  const nd2 = normalCDF(d2);
+  const npd1 = normalPDF(d1);
+
+  // Delta
+  const delta = type === 'call' ? nd1 : nd1 - 1;
+
+  // Gamma (same for calls and puts)
+  const gamma = npd1 / (spot * iv * sqrtT);
+
+  // Vega
+  const vega = spot * sqrtT * npd1 / 100;
+
+  // Theta
+  const theta = type === 'call'
+    ? -(spot * npd1 * iv) / (2 * sqrtT) - r * strike * Math.exp(-r * tte) * nd2
+    : -(spot * npd1 * iv) / (2 * sqrtT) + r * strike * Math.exp(-r * tte) * (1 - nd2);
+  
+  // Vanna: dDelta/dIV = d²V/dS/dσ
+  const vanna = -npd1 * d2 / iv;
+
+  // Charm: dDelta/dTime
+  const charm = -npd1 * (2 * r * tte - d2 * iv * sqrtT) / (2 * tte * iv * sqrtT);
+
+  return { delta, gamma, vega, theta, vanna, charm, d1, d2 };
 };
 
+// ═══════════════════════════════════════════════════════════════════════════════════
+// BUILD GEX PROFILE FROM REAL OPTIONS DATA
+// ═══════════════════════════════════════════════════════════════════════════════════
+
 /**
- * Build GEX profile from real options data or model estimates
+ * Build GEX Profile from real options chain data
  * 
- * @param {number} spot - Current SPX spot price
- * @param {Array} optionsChain - Real options chain from Polygon (if available)
- * @param {number} iv - Implied volatility (from VIX)
- * @returns {Object} GEX profile with all key levels
+ * @param {number} spot - Current SPX price
+ * @param {Array} optionsChain - Real options data from Polygon
+ * @param {number} vix - Current VIX (for IV if needed)
+ * @returns {Object} GEX Profile or unavailable status
  */
-export const buildGEXProfile = (spot, optionsChain = null, iv = 0.15) => {
-  const T = 1 / 365; // Focus on 0DTE
-  const r = 0.05;
+export const buildGEXProfile = (spot, optionsChain, vix = 15) => {
+  // If no real options data, return unavailable
+  if (!optionsChain || optionsChain.length === 0) {
+    console.log('⚠️ No real options data available - GEX cannot be calculated');
+    return {
+      available: false,
+      dataSource: 'NONE',
+      reason: 'Real options chain data required for GEX calculation',
+      spot,
+      timestamp: new Date(),
+    };
+  }
+
+  console.log(`📊 Building GEX from ${optionsChain.length} REAL options contracts`);
+
+  const iv = vix / 100; // Convert VIX to decimal
+  const strikes = new Map(); // strike -> { callGEX, putGEX, callOI, putOI, callDelta, putDelta }
+  
+  let totalCallGEX = 0;
+  let totalPutGEX = 0;
+  let totalVanna = 0;
+  let totalCharm = 0;
+  let contractsWithGreeks = 0;
+  let contractsCalculated = 0;
+
+  // Process each option contract
+  for (const opt of optionsChain) {
+    const strike = opt.strike;
+    const oi = opt.openInterest || 0;
+    
+    if (oi === 0) continue; // Skip no open interest
+    
+    // Get or initialize strike data
+    if (!strikes.has(strike)) {
+      strikes.set(strike, {
+        strike,
+        callGEX: 0,
+        putGEX: 0,
+        callOI: 0,
+        putOI: 0,
+        netGEX: 0,
+        callDelta: 0,
+        putDelta: 0,
+        vanna: 0,
+        charm: 0,
+      });
+    }
+    
+    const strikeData = strikes.get(strike);
+    const isCall = opt.type === 'call';
+    
+    // Get Greeks - prefer Polygon's, calculate if missing
+    let greeks = opt.greeks;
+    
+    if (!greeks || !greeks.gamma) {
+      // Calculate Greeks ourselves
+      const daysToExp = opt.expiration 
+        ? Math.max(1, (new Date(opt.expiration) - new Date()) / (365 * 24 * 60 * 60 * 1000))
+        : 7 / 365; // Default 7 days
+      
+      const optIV = opt.impliedVol || iv;
+      greeks = calculateGreeks(spot, strike, daysToExp, optIV, 0.05, opt.type);
+      contractsCalculated++;
+    } else {
+      contractsWithGreeks++;
+    }
+    
+    if (!greeks) continue;
+    
+    // Calculate GEX contribution
+    // GEX = Gamma * OI * 100 * Spot^2 / 1,000,000
+    // Dealers are OPPOSITE side of customer positions
+    // When customers are NET LONG calls, dealers are SHORT calls (negative gamma)
+    // When customers are NET LONG puts, dealers are LONG puts (positive gamma)
+    
+    const gamma = greeks.gamma || 0;
+    const gexContribution = gamma * oi * 100 * spot * spot / 1e6;
+    
+    if (isCall) {
+      // Dealers SHORT calls = negative gamma exposure
+      strikeData.callGEX -= gexContribution;
+      strikeData.callOI += oi;
+      strikeData.callDelta = greeks.delta || 0;
+      totalCallGEX -= gexContribution;
+    } else {
+      // Dealers LONG puts = positive gamma exposure  
+      strikeData.putGEX += gexContribution;
+      strikeData.putOI += oi;
+      strikeData.putDelta = greeks.delta || 0;
+      totalPutGEX += gexContribution;
+    }
+    
+    // Vanna and Charm
+    if (greeks.vanna) {
+      const vannaContrib = greeks.vanna * oi * 100;
+      strikeData.vanna += isCall ? -vannaContrib : vannaContrib;
+      totalVanna += isCall ? -vannaContrib : vannaContrib;
+    }
+    
+    if (greeks.charm) {
+      const charmContrib = greeks.charm * oi * 100;
+      strikeData.charm += isCall ? -charmContrib : charmContrib;
+      totalCharm += isCall ? -charmContrib : charmContrib;
+    }
+    
+    strikeData.netGEX = strikeData.callGEX + strikeData.putGEX;
+  }
+
+  // Find key levels
+  const strikesArray = Array.from(strikes.values())
+    .filter(s => Math.abs(s.strike - spot) < spot * 0.10) // Within 10% of spot
+    .sort((a, b) => b.strike - a.strike);
+
+  // Find Gamma Flip (where netGEX crosses zero)
+  let gammaFlip = spot;
+  let prevNetGEX = null;
+  
+  for (const s of strikesArray) {
+    if (prevNetGEX !== null && prevNetGEX * s.netGEX < 0) {
+      gammaFlip = s.strike;
+      break;
+    }
+    prevNetGEX = s.netGEX;
+  }
+
+  // Find major walls (highest GEX levels)
+  const callWalls = strikesArray
+    .filter(s => s.callOI > 0 && s.strike > spot)
+    .sort((a, b) => Math.abs(b.callGEX) - Math.abs(a.callGEX))
+    .slice(0, 5);
+  
+  const putWalls = strikesArray
+    .filter(s => s.putOI > 0 && s.strike < spot)
+    .sort((a, b) => Math.abs(b.putGEX) - Math.abs(a.putGEX))
+    .slice(0, 5);
+
+  // Determine regime
+  const netGEX = totalCallGEX + totalPutGEX;
+  const regime = netGEX > 0 ? 'POSITIVE' : 'NEGATIVE';
+  
+  // Build heatmap data
+  const heatmap = strikesArray.map(s => ({
+    strike: s.strike,
+    netGEX: s.netGEX,
+    callGEX: s.callGEX,
+    putGEX: s.putGEX,
+    callOI: s.callOI,
+    putOI: s.putOI,
+  }));
 
   const profile = {
+    available: true,
+    dataSource: 'REAL_OPTIONS',
+    
     spot,
     timestamp: new Date(),
-    iv,
-    dataSource: optionsChain?.length > 0 ? 'REAL' : 'MODEL',
     
-    // Key levels
-    gammaFlip: spot,
-    callWall: null,
-    putWall: null,
+    // Key Levels
+    gammaFlip,
+    majorCallWall: callWalls[0]?.strike || spot + 50,
+    majorPutWall: putWalls[0]?.strike || spot - 50,
     
-    // Exposures (in billions/millions)
-    netGEX: 0,
-    netDEX: 0,
-    netVEX: 0,
-    netVanna: 0,
-    netCharm: 0,
+    // Walls with detail
+    callWalls: callWalls.map(w => ({ strike: w.strike, gex: w.callGEX, oi: w.callOI })),
+    putWalls: putWalls.map(w => ({ strike: w.strike, gex: w.putGEX, oi: w.putOI })),
     
-    // Wall strengths
-    callWallGEX: 0,
-    putWallGEX: 0,
+    // Net Exposures
+    netGEX,
+    callGEX: totalCallGEX,
+    putGEX: totalPutGEX,
+    netVanna: totalVanna,
+    netCharm: totalCharm,
     
-    // Strike data for heatmap
-    strikes: [],
-    gexByStrike: {},
+    // Regime
+    regime,
+    regimeStrength: Math.abs(netGEX) > 1000 ? 'STRONG' : Math.abs(netGEX) > 500 ? 'MODERATE' : 'WEAK',
     
-    // Derived
-    regime: 'NEUTRAL',
-    vannaFlow: 0,
-    charmFlow: 0,
+    // Strike Data
+    strikes: strikesArray,
+    heatmap,
+    
+    // Data Quality
+    totalContracts: optionsChain.length,
+    contractsWithGreeks,
+    contractsCalculated,
+    
+    // Analysis
+    analysis: {
+      aboveGammaFlip: spot > gammaFlip,
+      nearCallWall: callWalls[0] && Math.abs(spot - callWalls[0].strike) < 10,
+      nearPutWall: putWalls[0] && Math.abs(spot - putWalls[0].strike) < 10,
+      vannaPositive: totalVanna > 0,
+      charmPositive: totalCharm > 0,
+    },
   };
 
-  let minAbsGEX = Infinity;
-
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  // USE REAL OPTIONS DATA IF AVAILABLE
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  
-  if (optionsChain && optionsChain.length > 0) {
-    console.log(`📊 Building GEX from ${optionsChain.length} REAL options contracts`);
-    
-    for (const opt of optionsChain) {
-      const strike = opt.strike;
-      if (!strike) continue;
-      
-      // Convert SPY strikes to SPX (SPY * 10)
-      const scaledStrike = strike * 10;
-      const dist = Math.abs(scaledStrike - spot);
-      if (dist > 150) continue;
-
-      const isCall = opt.type === 'call';
-      const oi = opt.openInterest || 0;
-      
-      // Use real Greeks if available, otherwise calculate
-      let gamma = opt.greeks?.gamma;
-      let delta = opt.greeks?.delta;
-      let vega = opt.greeks?.vega;
-      let vanna = opt.greeks?.vanna;
-      let charm = opt.greeks?.charm;
-      
-      if (!gamma) {
-        const optIv = opt.impliedVol || iv;
-        const greeks = calculateGreeks(spot, scaledStrike, T, r, optIv, isCall);
-        gamma = greeks.gamma;
-        delta = greeks.delta;
-        vega = greeks.vega;
-        vanna = greeks.vanna;
-        charm = greeks.charm;
-      }
-      
-      // GEX: Dealers are SHORT retail options
-      const gex = isCall 
-        ? -gamma * oi * 100 * spot  // Short calls = negative gamma
-        : gamma * oi * 100 * spot;   // Short puts = positive gamma (they hedge by buying)
-      
-      const dex = isCall ? -delta * oi * 100 : -delta * oi * 100;
-      const vex = -vega * oi * 100;
-      const vannaExp = vanna ? -vanna * oi * 100 : 0;
-      const charmExp = charm ? -charm * oi * 100 : 0;
-
-      // Accumulate
-      profile.netGEX += gex / 1e9;
-      profile.netDEX += dex / 1e6;
-      profile.netVEX += vex / 1e6;
-      profile.netVanna += vannaExp / 1e6;
-      profile.netCharm += charmExp / 1e6;
-
-      // Track by strike
-      if (!profile.gexByStrike[scaledStrike]) {
-        profile.gexByStrike[scaledStrike] = 0;
-      }
-      profile.gexByStrike[scaledStrike] += gex / 1e9;
-
-      // Find gamma flip
-      const strikeGEX = profile.gexByStrike[scaledStrike];
-      if (Math.abs(strikeGEX) < minAbsGEX && dist < 50) {
-        minAbsGEX = Math.abs(strikeGEX);
-        profile.gammaFlip = scaledStrike;
-      }
-
-      // Find walls
-      const absGEX = Math.abs(gex);
-      if (isCall && scaledStrike > spot && absGEX > profile.callWallGEX) {
-        profile.callWallGEX = absGEX / 1e9;
-        profile.callWall = scaledStrike;
-      }
-      if (!isCall && scaledStrike < spot && absGEX > profile.putWallGEX) {
-        profile.putWallGEX = absGEX / 1e9;
-        profile.putWall = scaledStrike;
-      }
-      
-      profile.strikes.push({
-        strike: scaledStrike,
-        gex: gex / 1e9,
-        callOI: isCall ? oi : 0,
-        putOI: isCall ? 0 : oi,
-        is100: scaledStrike % 100 === 0,
-        is50: scaledStrike % 50 === 0,
-        real: true,
-      });
-    }
-  }
-  
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  // MODEL-BASED ESTIMATES (when real data not available)
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  
-  else {
-    console.log('📊 Building GEX from MODEL (real options data not available)');
-    
-    // Model based on typical dealer positioning at major strikes
-    // This is based on observed patterns from SpotGamma/GEX research
-    
-    for (let i = -30; i <= 30; i++) {
-      const K = Math.round(spot / 5) * 5 + i * 5;
-      const dist = Math.abs(K - spot);
-      if (dist > 120) continue;
-
-      // OI clustering at round numbers
-      const is100 = K % 100 === 0;
-      const is50 = K % 50 === 0;
-      const is25 = K % 25 === 0;
-      const decay = Math.exp(-dist / 80);
-      
-      // Typical OI patterns (based on real market observations)
-      let baseCallOI = is100 ? 25000 : is50 ? 15000 : is25 ? 8000 : 4000;
-      let basePutOI = is100 ? 25000 : is50 ? 15000 : is25 ? 8000 : 4000;
-      
-      // Skew: more calls above spot, more puts below
-      baseCallOI *= K > spot ? 1.5 : 0.5;
-      basePutOI *= K < spot ? 1.5 : 0.5;
-      
-      // Add some realistic variation
-      const seed = K * 31 + Math.floor(spot);
-      const variation = 0.8 + ((seed % 100) / 250);
-      
-      const callOI = Math.floor(baseCallOI * decay * variation);
-      const putOI = Math.floor(basePutOI * decay * variation);
-
-      // Calculate Greeks
-      const callGreeks = calculateGreeks(spot, K, T, r, iv, true);
-      const putGreeks = calculateGreeks(spot, K, T, r, iv, false);
-
-      // GEX calculation
-      const callGEX = -callGreeks.gamma * callOI * 100 * spot;
-      const putGEX = putGreeks.gamma * putOI * 100 * spot;
-      const strikeGEX = (callGEX + putGEX) / 1e9;
-
-      // Other exposures
-      const dex = (-callGreeks.delta * callOI - putGreeks.delta * putOI) * 100 / 1e6;
-      const vanna = (-callGreeks.vanna * callOI - putGreeks.vanna * putOI) * 100 / 1e6;
-      const charm = (-callGreeks.charm * callOI - putGreeks.charm * putOI) * 100 / 1e6;
-
-      profile.netGEX += strikeGEX;
-      profile.netDEX += dex;
-      profile.netVanna += vanna;
-      profile.netCharm += charm;
-
-      profile.gexByStrike[K] = strikeGEX;
-      
-      profile.strikes.push({
-        strike: K,
-        gex: strikeGEX,
-        callOI,
-        putOI,
-        is100,
-        is50,
-        real: false,
-      });
-
-      // Find gamma flip
-      if (Math.abs(strikeGEX) < minAbsGEX && dist < 50) {
-        minAbsGEX = Math.abs(strikeGEX);
-        profile.gammaFlip = K;
-      }
-
-      // Find walls
-      if (K > spot && callOI > putOI * 1.5 && Math.abs(strikeGEX) > profile.callWallGEX) {
-        profile.callWallGEX = Math.abs(strikeGEX);
-        profile.callWall = K;
-      }
-      if (K < spot && putOI > callOI * 1.5 && Math.abs(strikeGEX) > profile.putWallGEX) {
-        profile.putWallGEX = Math.abs(strikeGEX);
-        profile.putWall = K;
-      }
-    }
-  }
-
-  // Sort strikes high to low
-  profile.strikes.sort((a, b) => b.strike - a.strike);
-
-  // Determine gamma regime
-  if (profile.netGEX > 0.5) {
-    profile.regime = 'POSITIVE_GAMMA';
-  } else if (profile.netGEX < -0.5) {
-    profile.regime = 'NEGATIVE_GAMMA';
-  } else {
-    profile.regime = 'NEUTRAL';
-  }
-
-  // Calculate distances
-  profile.distToCallWall = profile.callWall ? profile.callWall - spot : 999;
-  profile.distToPutWall = profile.putWall ? spot - profile.putWall : 999;
-  profile.distToFlip = spot - profile.gammaFlip;
-  profile.aboveFlip = spot > profile.gammaFlip;
-
-  // Predict flows
-  profile.vannaFlow = profile.netVanna * 0.01; // Per 1% IV change
-  profile.charmFlow = profile.netCharm * (1 / 6.5); // Per hour of trading
+  console.log(`   Gamma Flip: ${gammaFlip.toFixed(0)}`);
+  console.log(`   Call Wall: ${profile.majorCallWall.toFixed(0)}`);
+  console.log(`   Put Wall: ${profile.majorPutWall.toFixed(0)}`);
+  console.log(`   Regime: ${regime} (${profile.regimeStrength})`);
+  console.log(`   Net GEX: ${netGEX.toFixed(0)}M`);
 
   return profile;
 };
 
+// ═══════════════════════════════════════════════════════════════════════════════════
+// SCENARIO DETECTION (Based on Real GEX Data)
+// ═══════════════════════════════════════════════════════════════════════════════════
+
 /**
- * Detect trading scenarios based on GEX profile
+ * Detect trading scenarios based on GEX profile and price action
  */
-export const detectScenarios = (profile, candle, prevCandle) => {
+export const detectScenarios = (gexProfile, bars = [], currentTime = new Date()) => {
+  if (!gexProfile?.available) {
+    return [];
+  }
+
   const scenarios = [];
-  const { spot, callWall, putWall, gammaFlip, regime } = profile;
+  const spot = gexProfile.spot;
+  const hour = currentTime.getHours();
+  const minute = currentTime.getMinutes();
+  const dayMinute = hour * 60 + minute;
 
-  // Get current time info
-  const now = new Date();
-  const h = now.getHours() + now.getMinutes() / 60;
-  const dow = now.getDay();
+  // Time Windows (EST)
+  const timeWindows = {
+    opening: dayMinute >= 570 && dayMinute <= 630,      // 9:30 - 10:30
+    preLunch: dayMinute >= 690 && dayMinute <= 750,     // 11:30 - 12:30
+    powerHour: dayMinute >= 900 && dayMinute <= 960,    // 15:00 - 16:00
+    eodCharm: dayMinute >= 930,                         // 15:30+
+  };
+
+  // Get recent candle patterns if bars available
+  const recentBar = bars[0];
+  let candlePattern = null;
   
-  const isPrimeTime = (h >= 11 && h < 11.75) || (h >= 14.5 && h < 15.25);
-  const isLunch = h >= 11.75 && h < 14;
-  const isWeekend = dow === 0 || dow === 6;
-  const isFriday = dow === 5;
-
-  // Candle analysis
-  const body = candle ? candle.close - candle.open : 0;
-  const range = candle ? Math.max(candle.high - candle.low, 0.01) : 1;
-  const upperWick = candle ? candle.high - Math.max(candle.open, candle.close) : 0;
-  const lowerWick = candle ? Math.min(candle.open, candle.close) - candle.low : 0;
-
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  // SCENARIO 1: CALL WALL REJECTION (SHORT)
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  if (callWall && profile.distToCallWall <= 10) {
-    const isRejecting = upperWick > Math.abs(body) * 1.5 || (body < 0 && Math.abs(body) > range * 0.5);
-    const isTouching = profile.distToCallWall <= 3;
+  if (recentBar) {
+    const body = recentBar.close - recentBar.open;
+    const range = recentBar.high - recentBar.low;
+    const upperWick = recentBar.high - Math.max(recentBar.open, recentBar.close);
+    const lowerWick = Math.min(recentBar.open, recentBar.close) - recentBar.low;
     
-    let confidence = 40;
-    if (isTouching) confidence += 25;
-    else if (profile.distToCallWall <= 6) confidence += 15;
-    if (isRejecting) confidence += 20;
-    if (isPrimeTime) confidence += 15;
-    if (regime === 'POSITIVE_GAMMA') confidence += 5;
+    // Rejection patterns
+    if (upperWick > Math.abs(body) * 2 && body < 0) {
+      candlePattern = 'SHOOTING_STAR';
+    } else if (lowerWick > Math.abs(body) * 2 && body > 0) {
+      candlePattern = 'HAMMER';
+    } else if (Math.abs(body) > range * 0.7 && body < 0) {
+      candlePattern = 'BEARISH_MARUBOZU';
+    } else if (Math.abs(body) > range * 0.7 && body > 0) {
+      candlePattern = 'BULLISH_MARUBOZU';
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // SCENARIO 1: Call Wall Rejection (Bearish)
+  // ═══════════════════════════════════════════════════════════════════════════════
+  const callWall = gexProfile.callWalls[0];
+  if (callWall) {
+    const distToCallWall = Math.abs(spot - callWall.strike);
+    const isNearCallWall = distToCallWall < 10;
+    const isTouchingCallWall = distToCallWall < 3;
     
+    if (isNearCallWall || isTouchingCallWall) {
+      const confidence = calculateConfidence({
+        proximity: isTouchingCallWall ? 30 : 20,
+        gexStrength: Math.min(20, Math.abs(callWall.gex) / 50),
+        candlePattern: candlePattern === 'SHOOTING_STAR' ? 25 : 0,
+        timeWindow: timeWindows.preLunch || timeWindows.powerHour ? 15 : 0,
+        regime: gexProfile.regime === 'POSITIVE' ? 10 : 0,
+      });
+
+      scenarios.push({
+        type: 'CALL_WALL_REJECTION',
+        direction: 'SHORT',
+        confidence,
+        
+        trigger: callWall.strike,
+        entry: spot,
+        stop: callWall.strike + 5,
+        targets: [spot - 15, spot - 25, spot - 40],
+        
+        reason: `Price ${isTouchingCallWall ? 'AT' : 'near'} major call wall ${callWall.strike}`,
+        factors: {
+          wallStrength: Math.abs(callWall.gex).toFixed(0),
+          openInterest: callWall.oi,
+          proximity: distToCallWall.toFixed(1),
+          candlePattern,
+        },
+        
+        alert: confidence >= 75 && isTouchingCallWall && candlePattern === 'SHOOTING_STAR',
+      });
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // SCENARIO 2: Put Wall Bounce (Bullish)
+  // ═══════════════════════════════════════════════════════════════════════════════
+  const putWall = gexProfile.putWalls[0];
+  if (putWall) {
+    const distToPutWall = Math.abs(spot - putWall.strike);
+    const isNearPutWall = distToPutWall < 10;
+    const isTouchingPutWall = distToPutWall < 3;
+    
+    if (isNearPutWall || isTouchingPutWall) {
+      const confidence = calculateConfidence({
+        proximity: isTouchingPutWall ? 30 : 20,
+        gexStrength: Math.min(20, Math.abs(putWall.gex) / 50),
+        candlePattern: candlePattern === 'HAMMER' ? 25 : 0,
+        timeWindow: timeWindows.opening || timeWindows.preLunch ? 15 : 0,
+        regime: gexProfile.regime === 'NEGATIVE' ? 10 : 0,
+      });
+
+      scenarios.push({
+        type: 'PUT_WALL_BOUNCE',
+        direction: 'LONG',
+        confidence,
+        
+        trigger: putWall.strike,
+        entry: spot,
+        stop: putWall.strike - 5,
+        targets: [spot + 15, spot + 25, spot + 40],
+        
+        reason: `Price ${isTouchingPutWall ? 'AT' : 'near'} major put wall ${putWall.strike}`,
+        factors: {
+          wallStrength: Math.abs(putWall.gex).toFixed(0),
+          openInterest: putWall.oi,
+          proximity: distToPutWall.toFixed(1),
+          candlePattern,
+        },
+        
+        alert: confidence >= 75 && isTouchingPutWall && candlePattern === 'HAMMER',
+      });
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // SCENARIO 3: Gamma Flip Cross
+  // ═══════════════════════════════════════════════════════════════════════════════
+  const distToFlip = Math.abs(spot - gexProfile.gammaFlip);
+  if (distToFlip < 5) {
+    const crossingUp = spot > gexProfile.gammaFlip && recentBar?.close > recentBar?.open;
+    const crossingDown = spot < gexProfile.gammaFlip && recentBar?.close < recentBar?.open;
+    
+    const confidence = calculateConfidence({
+      proximity: 25,
+      momentum: crossingUp || crossingDown ? 20 : 0,
+      candlePattern: candlePattern === 'BULLISH_MARUBOZU' || candlePattern === 'BEARISH_MARUBOZU' ? 20 : 0,
+      timeWindow: timeWindows.opening ? 15 : 0,
+    });
+
+    if (crossingUp) {
+      scenarios.push({
+        type: 'GAMMA_FLIP_CROSS_UP',
+        direction: 'LONG',
+        confidence,
+        
+        trigger: gexProfile.gammaFlip,
+        entry: spot,
+        stop: gexProfile.gammaFlip - 8,
+        targets: [spot + 20, spot + 35, spot + 50],
+        
+        reason: `Crossing ABOVE gamma flip ${gexProfile.gammaFlip.toFixed(0)} - entering positive gamma`,
+        factors: {
+          gammaFlip: gexProfile.gammaFlip,
+          newRegime: 'POSITIVE',
+          candlePattern,
+        },
+        
+        alert: confidence >= 70,
+      });
+    } else if (crossingDown) {
+      scenarios.push({
+        type: 'GAMMA_FLIP_CROSS_DOWN',
+        direction: 'SHORT',
+        confidence,
+        
+        trigger: gexProfile.gammaFlip,
+        entry: spot,
+        stop: gexProfile.gammaFlip + 8,
+        targets: [spot - 20, spot - 35, spot - 50],
+        
+        reason: `Crossing BELOW gamma flip ${gexProfile.gammaFlip.toFixed(0)} - entering negative gamma`,
+        factors: {
+          gammaFlip: gexProfile.gammaFlip,
+          newRegime: 'NEGATIVE',
+          candlePattern,
+        },
+        
+        alert: confidence >= 70,
+      });
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // SCENARIO 4: Vanna Flow (IV Change Impact)
+  // ═══════════════════════════════════════════════════════════════════════════════
+  if (Math.abs(gexProfile.netVanna) > 1000) {
+    const vannaDirection = gexProfile.netVanna > 0 ? 'BULLISH' : 'BEARISH';
+    
+    const confidence = calculateConfidence({
+      vannaStrength: Math.min(30, Math.abs(gexProfile.netVanna) / 100),
+      timeWindow: timeWindows.opening ? 15 : 0,
+      regime: (vannaDirection === 'BULLISH' && gexProfile.regime === 'POSITIVE') ||
+              (vannaDirection === 'BEARISH' && gexProfile.regime === 'NEGATIVE') ? 15 : 0,
+    });
+
     scenarios.push({
-      id: 'CALL_WALL_REJECTION',
-      name: 'Call Wall Rejection',
-      icon: '🧱',
-      direction: 'SHORT',
-      active: profile.distToCallWall <= 5,
-      alert: isRejecting && isPrimeTime && isTouching && confidence >= 80,
-      confidence: Math.min(98, confidence),
-      description: `Price ${profile.distToCallWall.toFixed(1)} pts from Call Wall (${callWall})`,
-      target: gammaFlip,
-      targetPts: spot - gammaFlip,
+      type: 'VANNA_FLOW',
+      direction: vannaDirection === 'BULLISH' ? 'LONG' : 'SHORT',
+      confidence,
+      
       entry: spot,
-      stop: callWall + 3,
+      stop: vannaDirection === 'BULLISH' ? spot - 10 : spot + 10,
+      targets: vannaDirection === 'BULLISH' 
+        ? [spot + 15, spot + 25] 
+        : [spot - 15, spot - 25],
+      
+      reason: `Strong ${vannaDirection} Vanna flow - IV changes will push price ${vannaDirection === 'BULLISH' ? 'up' : 'down'}`,
+      factors: {
+        netVanna: gexProfile.netVanna.toFixed(0),
+        direction: vannaDirection,
+      },
+      
+      alert: confidence >= 65 && Math.abs(gexProfile.netVanna) > 2000,
     });
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  // SCENARIO 2: PUT WALL BOUNCE (LONG)
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  if (putWall && profile.distToPutWall <= 10) {
-    const isBouncing = lowerWick > Math.abs(body) * 1.5 || (body > 0 && Math.abs(body) > range * 0.5);
-    const isTouching = profile.distToPutWall <= 3;
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // SCENARIO 5: Charm Decay (End of Day Flow)
+  // ═══════════════════════════════════════════════════════════════════════════════
+  if (timeWindows.eodCharm && Math.abs(gexProfile.netCharm) > 500) {
+    const charmDirection = gexProfile.netCharm > 0 ? 'BULLISH' : 'BEARISH';
     
-    let confidence = 40;
-    if (isTouching) confidence += 25;
-    else if (profile.distToPutWall <= 6) confidence += 15;
-    if (isBouncing) confidence += 20;
-    if (isPrimeTime) confidence += 15;
-    if (regime === 'POSITIVE_GAMMA') confidence += 5;
-    
+    const confidence = calculateConfidence({
+      charmStrength: Math.min(25, Math.abs(gexProfile.netCharm) / 50),
+      timeWindow: 25, // EOD is crucial for charm
+      regime: gexProfile.regime === 'POSITIVE' ? 10 : 0,
+    });
+
     scenarios.push({
-      id: 'PUT_WALL_BOUNCE',
-      name: 'Put Wall Bounce',
-      icon: '💎',
-      direction: 'LONG',
-      active: profile.distToPutWall <= 5,
-      alert: isBouncing && isPrimeTime && isTouching && confidence >= 80,
-      confidence: Math.min(98, confidence),
-      description: `Price ${profile.distToPutWall.toFixed(1)} pts from Put Wall (${putWall})`,
-      target: gammaFlip,
-      targetPts: gammaFlip - spot,
+      type: 'CHARM_DECAY',
+      direction: charmDirection === 'BULLISH' ? 'LONG' : 'SHORT',
+      confidence,
+      
       entry: spot,
-      stop: putWall - 3,
+      stop: charmDirection === 'BULLISH' ? spot - 8 : spot + 8,
+      targets: charmDirection === 'BULLISH'
+        ? [spot + 10, spot + 18]
+        : [spot - 10, spot - 18],
+      
+      reason: `EOD Charm flow ${charmDirection} - time decay forcing dealer hedging`,
+      factors: {
+        netCharm: gexProfile.netCharm.toFixed(0),
+        direction: charmDirection,
+        timeToClose: `${Math.floor((960 - dayMinute) / 60)}h ${(960 - dayMinute) % 60}m`,
+      },
+      
+      alert: confidence >= 60 && dayMinute >= 930,
     });
   }
-
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  // SCENARIO 3: GAMMA FLIP CROSS
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  if (Math.abs(profile.distToFlip) <= 8) {
-    const crossingUp = prevCandle && prevCandle.close < gammaFlip && candle?.close > gammaFlip;
-    const crossingDown = prevCandle && prevCandle.close > gammaFlip && candle?.close < gammaFlip;
-    
-    let confidence = 35;
-    if (Math.abs(profile.distToFlip) <= 3) confidence += 20;
-    if (crossingUp || crossingDown) confidence += 25;
-    if (!isLunch) confidence += 10;
-    
-    scenarios.push({
-      id: 'GAMMA_FLIP_CROSS',
-      name: 'Gamma Flip Zone',
-      icon: '⚡',
-      direction: crossingUp ? 'LONG' : crossingDown ? 'SHORT' : 'WATCH',
-      active: Math.abs(profile.distToFlip) <= 3,
-      alert: (crossingUp || crossingDown) && !isLunch && confidence >= 70,
-      confidence: Math.min(90, confidence),
-      description: `${profile.aboveFlip ? 'Above' : 'Below'} γ-Flip (${gammaFlip}) by ${Math.abs(profile.distToFlip).toFixed(1)} pts`,
-      target: profile.aboveFlip ? callWall : putWall,
-    });
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  // SCENARIO 4: VANNA SQUEEZE
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  if (Math.abs(profile.vannaFlow) > 0.1) {
-    scenarios.push({
-      id: 'VANNA_SQUEEZE',
-      name: 'Vanna Flow',
-      icon: '🌊',
-      direction: profile.vannaFlow > 0 ? 'LONG' : 'SHORT',
-      active: Math.abs(profile.vannaFlow) > 0.2,
-      alert: false,
-      confidence: Math.min(75, 40 + Math.abs(profile.vannaFlow) * 100),
-      description: `IV change → ${profile.vannaFlow > 0 ? 'BUY' : 'SELL'} pressure from delta hedging`,
-    });
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  // SCENARIO 5: CHARM DECAY (EOD flows)
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  if (h >= 14 && Math.abs(profile.charmFlow) > 0.1) {
-    const isLastHour = h >= 15;
-    
-    scenarios.push({
-      id: 'CHARM_DECAY',
-      name: 'Charm Decay',
-      icon: '⏰',
-      direction: profile.charmFlow > 0 ? 'LONG' : 'SHORT',
-      active: isLastHour,
-      alert: false,
-      confidence: Math.min(80, 40 + Math.abs(profile.charmFlow) * 50 + (isLastHour ? 20 : 0)),
-      description: `Time decay → ${profile.charmFlow > 0 ? 'BUY' : 'SELL'} flow into close`,
-    });
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  // SCENARIO 6: REGIME
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  scenarios.push({
-    id: 'REGIME',
-    name: regime === 'POSITIVE_GAMMA' ? 'Positive Gamma' : regime === 'NEGATIVE_GAMMA' ? 'Negative Gamma' : 'Neutral Gamma',
-    icon: regime === 'POSITIVE_GAMMA' ? '✅' : regime === 'NEGATIVE_GAMMA' ? '⚠️' : '➖',
-    direction: regime === 'POSITIVE_GAMMA' ? 'FADE' : regime === 'NEGATIVE_GAMMA' ? 'TREND' : 'NEUTRAL',
-    active: true,
-    alert: false,
-    confidence: Math.min(85, 50 + Math.abs(profile.netGEX) * 20),
-    description: regime === 'POSITIVE_GAMMA' 
-      ? 'Dealers DAMPEN moves → Fade extremes, mean reversion' 
-      : regime === 'NEGATIVE_GAMMA' 
-        ? 'Dealers AMPLIFY moves → Trends extend, breakouts run' 
-        : 'Balanced positioning → Watch for regime change',
-  });
 
   // Sort by confidence
-  return scenarios.filter(s => s.confidence > 0).sort((a, b) => b.confidence - a.confidence);
+  scenarios.sort((a, b) => b.confidence - a.confidence);
+
+  return scenarios;
 };
 
-export default { buildGEXProfile, detectScenarios, calculateGreeks };
+// Calculate combined confidence score
+const calculateConfidence = (factors) => {
+  const values = Object.values(factors).filter(v => typeof v === 'number');
+  const total = values.reduce((sum, v) => sum + v, 0);
+  return Math.min(100, Math.max(0, total));
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// WEEKLY ANALYSIS (Based on last session + daily bars)
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+export const buildWeeklyAnalysis = (gexProfile, dailyBars = []) => {
+  if (!gexProfile?.available) {
+    return {
+      available: false,
+      reason: 'GEX profile required for weekly analysis',
+    };
+  }
+
+  if (!dailyBars.length) {
+    return {
+      available: false,
+      reason: 'Daily bars required for weekly analysis',
+    };
+  }
+
+  const lastBar = dailyBars[0];
+  const weekBars = dailyBars.slice(0, 5);
+  
+  // Weekly range
+  const weekHigh = Math.max(...weekBars.map(b => b.high));
+  const weekLow = Math.min(...weekBars.map(b => b.low));
+  const weekRange = weekHigh - weekLow;
+  
+  // Weekly trend
+  const weekOpen = weekBars[weekBars.length - 1]?.open || lastBar.open;
+  const weekClose = lastBar.close;
+  const weekTrend = weekClose > weekOpen ? 'BULLISH' : 'BEARISH';
+  const weekChange = ((weekClose - weekOpen) / weekOpen) * 100;
+
+  // Expected range based on ATR
+  const atrDaily = weekBars.reduce((sum, b) => sum + (b.high - b.low), 0) / weekBars.length;
+  const expectedWeekRange = atrDaily * 2.5; // 2.5x daily ATR for weekly expectation
+
+  // Key levels for next week
+  const analysis = {
+    available: true,
+    lastSession: {
+      date: lastBar.date,
+      close: lastBar.close,
+      high: lastBar.high,
+      low: lastBar.low,
+    },
+    
+    weekSummary: {
+      trend: weekTrend,
+      change: weekChange.toFixed(2) + '%',
+      high: weekHigh,
+      low: weekLow,
+      range: weekRange.toFixed(0),
+    },
+    
+    nextWeekExpectation: {
+      expectedRange: expectedWeekRange.toFixed(0),
+      bullishTarget: (lastBar.close + expectedWeekRange * 0.6).toFixed(0),
+      bearishTarget: (lastBar.close - expectedWeekRange * 0.6).toFixed(0),
+    },
+    
+    keyLevels: {
+      gammaFlip: gexProfile.gammaFlip,
+      majorCallWall: gexProfile.majorCallWall,
+      majorPutWall: gexProfile.majorPutWall,
+      weeklyHigh: weekHigh,
+      weeklyLow: weekLow,
+    },
+    
+    outlook: {
+      regime: gexProfile.regime,
+      bias: gexProfile.analysis.aboveGammaFlip ? 'BULLISH' : 'BEARISH',
+      notes: [],
+    },
+  };
+
+  // Add analysis notes
+  if (gexProfile.analysis.nearCallWall) {
+    analysis.outlook.notes.push('Price near call wall - expect resistance');
+  }
+  if (gexProfile.analysis.nearPutWall) {
+    analysis.outlook.notes.push('Price near put wall - expect support');
+  }
+  if (gexProfile.regime === 'POSITIVE') {
+    analysis.outlook.notes.push('Positive gamma regime - expect mean reversion, lower volatility');
+  } else {
+    analysis.outlook.notes.push('Negative gamma regime - expect trend continuation, higher volatility');
+  }
+
+  return analysis;
+};
+
+export default {
+  calculateGreeks,
+  buildGEXProfile,
+  detectScenarios,
+  buildWeeklyAnalysis,
+};

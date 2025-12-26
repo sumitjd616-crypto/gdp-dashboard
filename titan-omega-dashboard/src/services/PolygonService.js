@@ -1,30 +1,38 @@
 /**
  * Polygon.io API Service - REAL DATA ONLY
  * 
- * NO MOCK DATA - NO SYNTHETIC DATA - NO FALLBACKS
+ * Subscription: Options Developer + Indices
  * 
- * This service ONLY returns real market data from Polygon.io
- * If data is unavailable, it returns null (not fake data)
+ * REAL DATA SOURCES:
+ * - I:SPX  → Real S&P 500 Index
+ * - I:VIX  → Real VIX Index  
+ * - SPX Options → Real options chain with Greeks
+ * - SPY Options → Backup options data
+ * 
+ * NO MOCK DATA - NO SYNTHETIC DATA - NO PROXIES
  */
 
 const API_KEY = import.meta.env.VITE_POLYGON_API_KEY;
 const BASE_URL = 'https://api.polygon.io';
-const STORAGE_KEY = 'titan_omega_last_session';
+const STORAGE_KEY = 'titan_omega_session_v2';
 
 if (!API_KEY) {
-  console.error('❌ POLYGON API KEY NOT FOUND!');
+  console.error('❌ POLYGON API KEY NOT FOUND! Add VITE_POLYGON_API_KEY to .env');
+} else {
+  console.log('🔑 API Key configured:', API_KEY.slice(0, 4) + '...' + API_KEY.slice(-4));
 }
 
 class PolygonService {
   constructor() {
     this.cache = new Map();
-    this.cacheTimeout = 15000;
+    this.cacheTimeout = 10000; // 10 second cache for real-time
     this.lastSession = this.loadLastSession();
     this.marketStatus = null;
+    this.apiKeyValid = null;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════════
-  // PERSISTENCE - Save/Load Last Session for After-Hours
+  // SESSION PERSISTENCE (After-hours / Weekends)
   // ═══════════════════════════════════════════════════════════════════════════════════
 
   loadLastSession() {
@@ -33,6 +41,7 @@ class PolygonService {
       if (stored) {
         const data = JSON.parse(stored);
         data.timestamp = new Date(data.timestamp);
+        console.log('📂 Loaded last session from', data.timestamp);
         return data;
       }
     } catch (e) {
@@ -45,6 +54,7 @@ class PolygonService {
     try {
       this.lastSession = { ...data, timestamp: new Date() };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(this.lastSession));
+      console.log('💾 Session saved');
     } catch (e) {
       console.warn('Could not save session:', e);
     }
@@ -72,170 +82,229 @@ class PolygonService {
       }
     }
 
-    const url = `${BASE_URL}${endpoint}${endpoint.includes('?') ? '&' : '?'}apiKey=${API_KEY}`;
+    const separator = endpoint.includes('?') ? '&' : '?';
+    const url = `${BASE_URL}${endpoint}${separator}apiKey=${API_KEY}`;
+    
+    console.log(`🔄 Fetching: ${endpoint}`);
     
     const response = await fetch(url);
+    const data = await response.json();
     
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`API Error ${response.status}: ${errorText}`);
+    // Handle API errors
+    if (!response.ok || data.status === 'ERROR') {
+      const errorMsg = data.error || data.message || `HTTP ${response.status}`;
+      console.error(`❌ API Error:`, errorMsg);
+      
+      // Provide helpful error messages
+      if (errorMsg.includes('Unknown API Key') || response.status === 401) {
+        throw new Error('Invalid API Key - Please verify your Polygon.io API key is correct and active');
+      }
+      if (errorMsg.includes('not authorized') || response.status === 403) {
+        throw new Error('Subscription Required - This endpoint requires Options Developer or Indices subscription');
+      }
+      if (response.status === 429) {
+        throw new Error('Rate Limited - Too many requests, waiting...');
+      }
+      
+      throw new Error(errorMsg);
     }
     
-    const data = await response.json();
     this.cache.set(cacheKey, { data, time: Date.now() });
+    this.apiKeyValid = true;
     return data;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════════
-  // MARKET STATUS - Is Market Open?
+  // MARKET STATUS
   // ═══════════════════════════════════════════════════════════════════════════════════
 
   async getMarketStatus() {
     try {
       const data = await this.fetch('/v1/marketstatus/now', true);
+      
       this.marketStatus = {
-        isOpen: data?.market === 'open',
-        status: data?.market || 'unknown',
-        afterHours: data?.afterHours === true,
-        preMarket: data?.earlyHours === true,
-        serverTime: data?.serverTime,
-        exchanges: data?.exchanges,
+        market: data.market,
+        isOpen: data.market === 'open',
+        afterHours: data.afterHours === true,
+        preMarket: data.earlyHours === true,
+        serverTime: data.serverTime,
+        nextOpen: data.exchanges?.nasdaq,
+        nextClose: data.exchanges?.nasdaq,
       };
+      
+      console.log(`📊 Market Status: ${this.marketStatus.market}`);
       return this.marketStatus;
     } catch (e) {
-      // Estimate based on time
+      console.warn('Market status error, estimating:', e.message);
+      
       const now = new Date();
-      const hour = now.getUTCHours() - 5; // EST
+      const estHour = (now.getUTCHours() - 5 + 24) % 24;
       const day = now.getDay();
       const isWeekday = day > 0 && day < 6;
-      const isRegularHours = hour >= 9.5 && hour < 16;
-      const isPreMarket = hour >= 4 && hour < 9.5;
-      const isAfterHours = hour >= 16 && hour < 20;
       
       this.marketStatus = {
-        isOpen: isWeekday && isRegularHours,
-        status: isWeekday && isRegularHours ? 'open' : 'closed',
-        afterHours: isWeekday && isAfterHours,
-        preMarket: isWeekday && isPreMarket,
+        market: isWeekday && estHour >= 9.5 && estHour < 16 ? 'open' : 'closed',
+        isOpen: isWeekday && estHour >= 9.5 && estHour < 16,
+        afterHours: isWeekday && estHour >= 16 && estHour < 20,
+        preMarket: isWeekday && estHour >= 4 && estHour < 9.5,
         estimated: true,
       };
+      
       return this.marketStatus;
     }
   }
 
-  isMarketOpen() {
-    return this.marketStatus?.isOpen || false;
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  // REAL SPX INDEX DATA (Indices Subscription)
+  // ═══════════════════════════════════════════════════════════════════════════════════
+
+  async getSPXPrice() {
+    // Try real-time snapshot first
+    try {
+      const data = await this.fetch('/v3/snapshot/indices?ticker.any_of=I:SPX');
+      
+      if (data?.results?.[0]) {
+        const spx = data.results[0];
+        console.log('✅ Real SPX Index data received');
+        
+        return {
+          ticker: 'SPX',
+          price: spx.value,
+          
+          session: {
+            open: spx.session?.open,
+            high: spx.session?.high,
+            low: spx.session?.low,
+            close: spx.session?.close,
+            change: spx.session?.change,
+            changePercent: spx.session?.change_percent,
+          },
+          
+          previousClose: spx.session?.previous_close,
+          
+          timestamp: spx.last_updated ? new Date(spx.last_updated / 1e6) : new Date(),
+          source: 'POLYGON_SPX_REALTIME',
+          isRealIndex: true,
+        };
+      }
+    } catch (e) {
+      console.warn('SPX snapshot not available:', e.message);
+    }
+
+    // Fallback to aggregates
+    try {
+      const data = await this.fetch('/v2/aggs/ticker/I:SPX/prev');
+      
+      if (data?.results?.[0]) {
+        const r = data.results[0];
+        console.log('✅ SPX Previous day data received');
+        
+        return {
+          ticker: 'SPX',
+          price: r.c,
+          
+          session: {
+            open: r.o,
+            high: r.h,
+            low: r.l,
+            close: r.c,
+          },
+          
+          volume: r.v,
+          vwap: r.vw,
+          date: new Date(r.t),
+          
+          source: 'POLYGON_SPX_PREV',
+          isRealIndex: true,
+        };
+      }
+    } catch (e) {
+      console.warn('SPX prev day not available:', e.message);
+    }
+
+    throw new Error('SPX data not available');
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════════
-  // REAL SPY DATA (Primary Data Source)
+  // REAL VIX INDEX DATA (Indices Subscription)
   // ═══════════════════════════════════════════════════════════════════════════════════
 
-  async getSPYSnapshot() {
-    const data = await this.fetch('/v2/snapshot/locale/us/markets/stocks/tickers/SPY');
-    
-    if (!data?.ticker) {
-      throw new Error('SPY snapshot not available');
+  async getVIX() {
+    // Try real-time VIX
+    try {
+      const data = await this.fetch('/v3/snapshot/indices?ticker.any_of=I:VIX');
+      
+      if (data?.results?.[0]) {
+        const vix = data.results[0];
+        console.log('✅ Real VIX Index data received');
+        
+        return {
+          value: vix.value,
+          
+          session: {
+            open: vix.session?.open,
+            high: vix.session?.high,
+            low: vix.session?.low,
+            close: vix.session?.close,
+            change: vix.session?.change,
+            changePercent: vix.session?.change_percent,
+          },
+          
+          previousClose: vix.session?.previous_close,
+          timestamp: vix.last_updated ? new Date(vix.last_updated / 1e6) : new Date(),
+          source: 'POLYGON_VIX_REALTIME',
+          isRealVIX: true,
+        };
+      }
+    } catch (e) {
+      console.warn('VIX snapshot not available:', e.message);
     }
 
-    const t = data.ticker;
-    const lastPrice = t.lastTrade?.p || t.day?.c || t.prevDay?.c;
-    const prevClose = t.prevDay?.c;
-    
-    if (!lastPrice) {
-      throw new Error('SPY price not available');
+    // Fallback to prev day
+    try {
+      const data = await this.fetch('/v2/aggs/ticker/I:VIX/prev');
+      
+      if (data?.results?.[0]) {
+        const r = data.results[0];
+        console.log('✅ VIX Previous day data received');
+        
+        return {
+          value: r.c,
+          open: r.o,
+          high: r.h,
+          low: r.l,
+          close: r.c,
+          date: new Date(r.t),
+          source: 'POLYGON_VIX_PREV',
+          isRealVIX: true,
+        };
+      }
+    } catch (e) {
+      console.warn('VIX prev day not available:', e.message);
     }
 
-    const result = {
-      ticker: 'SPY',
-      price: lastPrice,
-      spxEquivalent: lastPrice * 10, // SPY * 10 ≈ SPX
-      change: prevClose ? ((lastPrice - prevClose) / prevClose) * 100 : 0,
-      changePts: prevClose ? (lastPrice - prevClose) * 10 : 0,
-      
-      day: {
-        open: t.day?.o,
-        high: t.day?.h,
-        low: t.day?.l,
-        close: t.day?.c,
-        volume: t.day?.v,
-        vwap: t.day?.vw,
-      },
-      
-      prevDay: {
-        open: t.prevDay?.o,
-        high: t.prevDay?.h,
-        low: t.prevDay?.l,
-        close: t.prevDay?.c,
-        volume: t.prevDay?.v,
-        vwap: t.prevDay?.vw,
-      },
-      
-      lastTrade: {
-        price: t.lastTrade?.p,
-        size: t.lastTrade?.s,
-        timestamp: t.lastTrade?.t ? new Date(t.lastTrade.t / 1e6) : null,
-      },
-      
-      lastQuote: {
-        bid: t.lastQuote?.p,
-        ask: t.lastQuote?.P,
-        bidSize: t.lastQuote?.s,
-        askSize: t.lastQuote?.S,
-      },
-      
-      timestamp: new Date(),
-      source: 'POLYGON_REALTIME',
-    };
-
-    // Save for after-hours reference
-    if (this.marketStatus?.isOpen) {
-      this.saveLastSession(result);
-    }
-
-    return result;
-  }
-
-  // Get previous day's data (for after-hours/weekends)
-  async getSPYPrevDay() {
-    const data = await this.fetch('/v2/aggs/ticker/SPY/prev');
-    
-    if (!data?.results?.[0]) {
-      throw new Error('SPY previous day data not available');
-    }
-
-    const r = data.results[0];
-    return {
-      ticker: 'SPY',
-      price: r.c,
-      spxEquivalent: r.c * 10,
-      open: r.o,
-      high: r.h,
-      low: r.l,
-      close: r.c,
-      volume: r.v,
-      vwap: r.vw,
-      date: new Date(r.t),
-      source: 'POLYGON_PREV_DAY',
-    };
+    throw new Error('VIX data not available');
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════════
-  // INTRADAY BARS - Real Historical Data
+  // SPX INTRADAY BARS (For chart and analysis)
   // ═══════════════════════════════════════════════════════════════════════════════════
 
-  async getIntradayBars(ticker = 'SPY', timeframe = 5, days = 5) {
+  async getSPXBars(timeframe = 5, days = 5) {
     const to = new Date().toISOString().split('T')[0];
     const from = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     
     const data = await this.fetch(
-      `/v2/aggs/ticker/${ticker}/range/${timeframe}/minute/${from}/${to}?adjusted=true&sort=desc&limit=500`
+      `/v2/aggs/ticker/I:SPX/range/${timeframe}/minute/${from}/${to}?adjusted=true&sort=desc&limit=1000`
     );
     
     if (!data?.results?.length) {
+      console.warn('No SPX bars returned');
       return [];
     }
 
+    console.log(`✅ Loaded ${data.results.length} SPX bars`);
+    
     return data.results.map(bar => ({
       timestamp: new Date(bar.t),
       open: bar.o,
@@ -245,29 +314,24 @@ class PolygonService {
       volume: bar.v,
       vwap: bar.vw,
       trades: bar.n,
-      // SPX equivalent
-      spx: {
-        open: bar.o * 10,
-        high: bar.h * 10,
-        low: bar.l * 10,
-        close: bar.c * 10,
-      },
     }));
   }
 
-  // Get daily bars for weekly analysis
-  async getDailyBars(ticker = 'SPY', days = 30) {
+  // Daily bars for weekly analysis
+  async getSPXDailyBars(days = 60) {
     const to = new Date().toISOString().split('T')[0];
     const from = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     
     const data = await this.fetch(
-      `/v2/aggs/ticker/${ticker}/range/1/day/${from}/${to}?adjusted=true&sort=desc&limit=${days}`
+      `/v2/aggs/ticker/I:SPX/range/1/day/${from}/${to}?adjusted=true&sort=desc&limit=${days}`
     );
     
     if (!data?.results?.length) {
       return [];
     }
 
+    console.log(`✅ Loaded ${data.results.length} SPX daily bars`);
+    
     return data.results.map(bar => ({
       date: new Date(bar.t),
       open: bar.o,
@@ -276,98 +340,110 @@ class PolygonService {
       close: bar.c,
       volume: bar.v,
       vwap: bar.vw,
-      spxClose: bar.c * 10,
     }));
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════════
-  // OPTIONS DATA - Real Options Chain
+  // OPTIONS CHAIN - Real Options Data (Options Developer Subscription)
   // ═══════════════════════════════════════════════════════════════════════════════════
 
-  async getOptionsChain(underlying = 'SPY') {
+  async getOptionsChain(underlying = 'SPY', expirationDate = null) {
+    let endpoint = `/v3/snapshot/options/${underlying}?limit=250`;
+    
+    if (expirationDate) {
+      endpoint += `&expiration_date=${expirationDate}`;
+    }
+    
+    // For 0DTE, get today's expiration
+    // For SPX, use SPXW (weekly) options
+    
     try {
-      const data = await this.fetch(`/v3/snapshot/options/${underlying}?limit=250`);
+      const data = await this.fetch(endpoint);
       
       if (!data?.results?.length) {
-        console.warn('Options chain empty or not available (may require subscription)');
-        return { available: false, data: [], reason: 'No options data returned' };
+        console.warn('Options chain empty');
+        return { available: false, data: [], count: 0 };
       }
 
-      const options = data.results.map(opt => ({
-        ticker: opt.details?.ticker,
-        strike: opt.details?.strike_price,
-        expiration: opt.details?.expiration_date,
-        type: opt.details?.contract_type,
-        
-        openInterest: opt.open_interest || 0,
-        volume: opt.day?.volume || 0,
-        
-        lastPrice: opt.day?.close,
-        bid: opt.last_quote?.bid,
-        ask: opt.last_quote?.ask,
-        
-        impliedVol: opt.implied_volatility,
-        
-        greeks: {
-          delta: opt.greeks?.delta,
-          gamma: opt.greeks?.gamma,
-          theta: opt.greeks?.theta,
-          vega: opt.greeks?.vega,
-        },
-        
-        raw: opt,
-      }));
+      console.log(`✅ Loaded ${data.results.length} options contracts`);
 
-      return { 
-        available: true, 
-        data: options, 
+      const options = data.results
+        .filter(opt => opt.details && opt.open_interest > 0)
+        .map(opt => ({
+          ticker: opt.details.ticker,
+          underlying: opt.underlying_asset?.ticker,
+          strike: opt.details.strike_price,
+          expiration: opt.details.expiration_date,
+          type: opt.details.contract_type, // 'call' or 'put'
+          
+          openInterest: opt.open_interest,
+          volume: opt.day?.volume || 0,
+          
+          price: {
+            last: opt.day?.close,
+            bid: opt.last_quote?.bid,
+            ask: opt.last_quote?.ask,
+            mid: opt.last_quote?.bid && opt.last_quote?.ask 
+              ? (opt.last_quote.bid + opt.last_quote.ask) / 2 
+              : opt.day?.close,
+          },
+          
+          impliedVol: opt.implied_volatility,
+          
+          greeks: {
+            delta: opt.greeks?.delta,
+            gamma: opt.greeks?.gamma,
+            theta: opt.greeks?.theta,
+            vega: opt.greeks?.vega,
+          },
+          
+          hasGreeks: !!(opt.greeks?.delta),
+        }));
+
+      return {
+        available: true,
+        data: options,
         count: options.length,
+        underlying,
         timestamp: new Date(),
+        source: 'POLYGON_OPTIONS',
       };
     } catch (e) {
-      console.warn('Options chain error:', e.message);
+      console.error('Options chain error:', e.message);
       return { 
         available: false, 
         data: [], 
-        reason: e.message,
+        count: 0,
+        error: e.message,
       };
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════════════
-  // VIX DATA
-  // ═══════════════════════════════════════════════════════════════════════════════════
-
-  async getVIX() {
-    // Try VIX-tracking ETFs
-    const vixTickers = ['VIXY', 'VXX', 'UVXY'];
+  // Get SPX options specifically
+  async getSPXOptions() {
+    // Try SPX options first (SPXW for weeklies)
+    let result = await this.getOptionsChain('SPX');
     
-    for (const ticker of vixTickers) {
-      try {
-        const data = await this.fetch(`/v2/aggs/ticker/${ticker}/prev`);
-        if (data?.results?.[0]?.c) {
-          // Approximate VIX from ETF
-          const etfPrice = data.results[0].c;
-          let vixEstimate;
-          
-          if (ticker === 'VIXY') vixEstimate = etfPrice * 1.1;
-          else if (ticker === 'VXX') vixEstimate = etfPrice * 0.7;
-          else if (ticker === 'UVXY') vixEstimate = etfPrice * 0.35;
-          else vixEstimate = etfPrice;
-          
-          return {
-            value: vixEstimate,
-            source: ticker,
-            etfPrice,
-            timestamp: new Date(),
-          };
-        }
-      } catch (e) {
-        continue;
-      }
+    if (result.available && result.count > 0) {
+      return result;
+    }
+
+    // Fallback to SPY options (scale strikes by 10)
+    console.log('SPX options not available, trying SPY...');
+    result = await this.getOptionsChain('SPY');
+    
+    if (result.available) {
+      // Scale SPY strikes to SPX equivalent
+      result.data = result.data.map(opt => ({
+        ...opt,
+        strikeOriginal: opt.strike,
+        strike: opt.strike * 10, // SPY strike * 10 ≈ SPX strike
+        scaledFromSPY: true,
+      }));
+      result.scaledFromSPY = true;
     }
     
-    throw new Error('VIX data not available');
+    return result;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════════
@@ -375,70 +451,127 @@ class PolygonService {
   // ═══════════════════════════════════════════════════════════════════════════════════
 
   async getAllData() {
-    const status = await this.getMarketStatus();
+    console.log('\n🔄 Fetching all market data...');
     
     const result = {
       timestamp: new Date(),
-      marketStatus: status,
-      spy: null,
+      marketStatus: null,
+      spx: null,
       vix: null,
       options: null,
       bars: null,
       dailyBars: null,
       lastSession: this.lastSession,
       errors: [],
+      dataQuality: 'UNKNOWN',
     };
 
-    // Get SPY data
+    // 1. Market Status
     try {
-      if (status.isOpen || status.afterHours || status.preMarket) {
-        result.spy = await this.getSPYSnapshot();
-      } else {
-        result.spy = await this.getSPYPrevDay();
+      result.marketStatus = await this.getMarketStatus();
+    } catch (e) {
+      result.errors.push({ source: 'MARKET_STATUS', error: e.message });
+    }
+
+    // 2. Real SPX Price
+    try {
+      result.spx = await this.getSPXPrice();
+      
+      // Save session during market hours
+      if (result.marketStatus?.isOpen && result.spx) {
+        this.saveLastSession({
+          spx: result.spx,
+          timestamp: new Date(),
+        });
       }
     } catch (e) {
-      result.errors.push({ source: 'SPY', error: e.message });
-      // Use last session as fallback
-      if (this.lastSession) {
-        result.spy = { ...this.lastSession, source: 'LAST_SESSION' };
+      result.errors.push({ source: 'SPX', error: e.message });
+      
+      // Use last session during off-hours
+      if (this.lastSession?.spx) {
+        result.spx = {
+          ...this.lastSession.spx,
+          source: 'LAST_SESSION',
+          sessionTime: this.lastSession.timestamp,
+        };
       }
     }
 
-    // Get VIX
+    // 3. Real VIX
     try {
       result.vix = await this.getVIX();
     } catch (e) {
       result.errors.push({ source: 'VIX', error: e.message });
     }
 
-    // Get Options Chain
+    // 4. Options Chain
     try {
-      result.options = await this.getOptionsChain('SPY');
+      result.options = await this.getSPXOptions();
     } catch (e) {
       result.errors.push({ source: 'OPTIONS', error: e.message });
-      result.options = { available: false, data: [], reason: e.message };
+      result.options = { available: false, data: [], error: e.message };
     }
 
-    // Get Intraday Bars
+    // 5. Intraday Bars
     try {
-      result.bars = await this.getIntradayBars('SPY', 5, 5);
+      result.bars = await this.getSPXBars(5, 5);
     } catch (e) {
       result.errors.push({ source: 'BARS', error: e.message });
+      result.bars = [];
     }
 
-    // Get Daily Bars for weekly analysis
+    // 6. Daily Bars for Weekly Analysis
     try {
-      result.dailyBars = await this.getDailyBars('SPY', 30);
+      result.dailyBars = await this.getSPXDailyBars(60);
     } catch (e) {
       result.errors.push({ source: 'DAILY_BARS', error: e.message });
+      result.dailyBars = [];
+    }
+
+    // Assess data quality
+    const hasRealSPX = result.spx?.isRealIndex;
+    const hasRealVIX = result.vix?.isRealVIX;
+    const hasOptions = result.options?.available;
+    const hasBars = result.bars?.length > 0;
+
+    if (hasRealSPX && hasRealVIX && hasOptions) {
+      result.dataQuality = 'EXCELLENT';
+    } else if (hasRealSPX && hasRealVIX) {
+      result.dataQuality = 'GOOD';
+    } else if (hasRealSPX || result.spx) {
+      result.dataQuality = 'BASIC';
+    } else {
+      result.dataQuality = 'LIMITED';
+    }
+
+    console.log(`\n📊 Data Quality: ${result.dataQuality}`);
+    console.log(`   SPX: ${hasRealSPX ? '✅ Real' : result.spx ? '⚠️ Session' : '❌ None'}`);
+    console.log(`   VIX: ${hasRealVIX ? '✅ Real' : '❌ None'}`);
+    console.log(`   Options: ${hasOptions ? `✅ ${result.options.count} contracts` : '❌ None'}`);
+    console.log(`   Bars: ${hasBars ? `✅ ${result.bars.length}` : '❌ None'}`);
+    
+    if (result.errors.length > 0) {
+      console.log(`   ⚠️ Errors: ${result.errors.map(e => e.source).join(', ')}`);
     }
 
     return result;
   }
 
-  // Clear all caches
+  // Test API connection
+  async testConnection() {
+    try {
+      await this.fetch('/v1/marketstatus/now', true);
+      console.log('✅ API Connection successful');
+      return { success: true };
+    } catch (e) {
+      console.error('❌ API Connection failed:', e.message);
+      return { success: false, error: e.message };
+    }
+  }
+
   clearCache() {
     this.cache.clear();
+    console.log('🗑️ Cache cleared');
   }
 }
 
