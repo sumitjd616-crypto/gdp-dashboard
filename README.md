@@ -1,19 +1,32 @@
-# :earth_americas: GDP dashboard template
+# SPX live move dashboard (15+ points)
 
-A simple Streamlit app showing the GDP of different countries in the world.
+A Streamlit dashboard that monitors the S&P 500 index (SPX / `^GSPC`) and highlights when the **live move is ≥ 15 index points** vs the prior close.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://gdp-dashboard-template.streamlit.app/)
+## Data sources
 
-### How to run it on your own machine
+- **Default (no API key)**: Yahoo Finance via `yfinance` (`^GSPC`). Quotes are typically delayed.
+- **Optional (API key)**: Polygon.io index snapshot (recommended for “real-time” if your plan includes it).
 
-1. Install the requirements
+## Configure API key (optional)
 
-   ```
-   $ pip install -r requirements.txt
-   ```
+Set an environment variable:
 
-2. Run the app
+```bash
+export POLYGON_API_KEY="YOUR_KEY_HERE"
+```
 
-   ```
-   $ streamlit run streamlit_app.py
-   ```
+Or use Streamlit secrets (recommended):
+
+- Create `.streamlit/secrets.toml`
+- Add:
+
+```toml
+POLYGON_API_KEY="YOUR_KEY_HERE"
+```
+
+## How to run locally
+
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
