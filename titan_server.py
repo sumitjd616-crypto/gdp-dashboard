@@ -1,0 +1,1643 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import sqlite3
+import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
+import httpx
+import numpy as np
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+
+logger = logging.getLogger("titan")
+
+
+# -----------------------------------------------------------------------------
+# GLOBAL_STATE (single source of truth)
+
+GLOBAL_STATE: Dict[str, Any] = {
+    # Engine / session
+    "engine_status": "BOOTING",  # OK | DEGRADED | OFFLINE | MARKET_CLOSED | BOOTING
+    "engine_reason": None,
+    "ws_ok": True,
+    "loop_ms": None,
+    "exposures_ms": None,
+    "contracts_processed": None,
+    "last_tick_ny": None,
+    "latency_ms": None,
+    "market_session": None,  # OPEN | CLOSED | PRE | POST | UNKNOWN
+    # Data integrity
+    "spot": None,
+    "spot_valid": False,
+    "spot_age_s": None,
+    "last_close": None,
+    "options_age_s": None,
+    "data_integrity": "red",  # green | amber | red
+    # Proxy labeling + coverage/confidence (never imply true dealer book)
+    "proxy_label": "Dealer-exposure proxy (OI+greeks)",
+    "coverage": None,  # dict or None
+    "confidence": None,  # HIGH | MED | LOW | None
+    # Exposures
+    "net_gex": None,
+    "net_vex": None,
+    "net_cex": None,  # N/A unless Polygon provides needed greek
+    "net_delta": None,
+    "d_gex": None,
+    "d_delta": None,
+    # Levels / higher-order proxies (Polygon inputs, model outputs)
+    "gamma_flip": None,  # strike/level proxy
+    "gamma_walls": None,  # list[{strike, gex}]
+    "net_vanna": None,
+    "net_charm": None,
+    # Vol regime
+    "vol_short": None,
+    "vol_long": None,
+    "vol_rising": None,
+    # Alert state
+    "regime": "NEUTRAL",  # PRE | FLUSH | CHARM | NEUTRAL
+    "trigger_text": "NEUTRAL: Wait for structure.",
+    "why": [],
+    "scenario": None,
+    # Weighted sync output (model-based, Polygon inputs only)
+    "mood": None,  # TREND | VOL_EXPANSION | MEAN_REVERT | CHOP | UNKNOWN
+    "trade_bias": None,  # UP | DOWN | MEAN_REVERT | WAIT | None
+    "trade_confidence": None,  # 0-100 (signal alignment confidence, NOT data coverage)
+    "trade_logic": None,  # list[str] concise breakdown
+    "last_alert_id": None,
+    # For UI charts
+    "spot_series": [],  # list[{ts_ms, price}]
+    "vol_series": [],  # list[{ts_ms, vol_short, vol_long}]
+}
+
+
+# -----------------------------------------------------------------------------
+# Config
+
+
+@dataclass(frozen=True)
+class TitanConfig:
+    polygon_api_key: str
+    db_path: str
+    static_dir: str
+    spot_symbol: str = "SPY"  # SPX via SPY proxy (as requested)
+    options_underlying: str = "SPY"
+    marketstatus_url: str = "https://api.polygon.io/v1/marketstatus/now"
+    last_trade_url: str = "https://api.polygon.io/v2/last/trade/{ticker}"
+    aggs_url: str = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{from_}/{to_}"
+    options_snapshot_url: str = (
+        "https://api.polygon.io/v3/snapshot/options/{underlying}"
+    )
+    # Engine cadence
+    poll_s: float = 2.0
+    # "0.05%" stall threshold default from spec
+    spot_stall_threshold_frac: float = 0.0005
+    # Percentile for d_delta trigger
+    d_delta_percentile: float = 90.0
+    # Rolling windows
+    deriv_window_minutes: int = 30
+    spot_stall_lookback_s: int = 30
+    # Integrity thresholds
+    spot_max_age_s: int = 10
+    options_max_age_s: int = 180
+    # Alert cooldowns
+    pre_cooldown_s: int = 60
+    flush_cooldown_s: int = 120
+    charm_cooldown_s: int = 120
+    # Outcome evaluator
+    evaluator_poll_s: float = 45.0
+
+
+# -----------------------------------------------------------------------------
+# SQLite (TitanArchive)
+
+
+def _db_connect(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def migrate_sqlite(db_path: str) -> None:
+    """
+    Safe to run multiple times.
+    """
+    conn = _db_connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alerts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT NOT NULL,
+              regime TEXT NOT NULL,
+              message TEXT NOT NULL,
+              trigger_text TEXT,
+              scenario TEXT,
+              confidence TEXT,
+              why_json TEXT,
+              levels_json TEXT,
+              coverage_json TEXT,
+              mood TEXT,
+              trade_bias TEXT,
+              trade_confidence REAL,
+              trade_logic_json TEXT,
+              spot REAL,
+              net_gex REAL,
+              net_vex REAL,
+              net_cex REAL,
+              net_delta REAL,
+              d_gex REAL,
+              d_delta REAL,
+              gamma_flip REAL,
+              net_vanna REAL,
+              net_charm REAL,
+              vol_short REAL,
+              vol_long REAL,
+              vol_rising INTEGER
+            );
+            """
+        )
+        # Safe column add for existing DBs (SQLite has no IF NOT EXISTS for columns).
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN scenario TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN confidence TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN levels_json TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN coverage_json TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN mood TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN trade_bias TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN trade_confidence REAL;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN trade_logic_json TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN gamma_flip REAL;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN net_vanna REAL;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN net_charm REAL;")
+        except Exception:
+            pass
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outcomes (
+              alert_id INTEGER NOT NULL,
+              horizon_minutes INTEGER NOT NULL,
+              moved_15pt_equiv INTEGER NOT NULL,
+              max_favor REAL,
+              max_adverse REAL,
+              evaluated_ts TEXT NOT NULL,
+              PRIMARY KEY (alert_id, horizon_minutes),
+              FOREIGN KEY (alert_id) REFERENCES alerts(id)
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alerts_regime ON alerts(regime);"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# -----------------------------------------------------------------------------
+# Polygon helpers (REAL data only)
+
+
+async def polygon_get_json(
+    client: httpx.AsyncClient,
+    url: str,
+    api_key: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout_s: float = 8.0,
+) -> Dict[str, Any]:
+    p = dict(params or {})
+    p["apiKey"] = api_key
+    r = await client.get(url, params=p, timeout=timeout_s)
+    r.raise_for_status()
+    return r.json()
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _ts_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+async def fetch_market_session(
+    client: httpx.AsyncClient, cfg: TitanConfig
+) -> Tuple[str, Optional[str]]:
+    try:
+        data = await polygon_get_json(client, cfg.marketstatus_url, cfg.polygon_api_key)
+        # Polygon's response includes keys like: market, earlyHours, afterHours
+        # We normalize to OPEN/CLOSED/UNKNOWN for UI.
+        if isinstance(data, dict) and data.get("market") in ("open", "closed"):
+            sess = "OPEN" if data["market"] == "open" else "CLOSED"
+            return sess, None
+        return "UNKNOWN", "Polygon marketstatus missing 'market' field"
+    except Exception as e:  # defensive
+        return "UNKNOWN", f"marketstatus error: {type(e).__name__}"
+
+
+async def fetch_last_trade(
+    client: httpx.AsyncClient, cfg: TitanConfig, ticker: str
+) -> Tuple[Optional[float], Optional[int], Optional[str]]:
+    """
+    Returns (price, ts_ms, reason_if_missing).
+    """
+    try:
+        url = cfg.last_trade_url.format(ticker=ticker)
+        data = await polygon_get_json(client, url, cfg.polygon_api_key)
+        last = (data or {}).get("last")
+        if not last:
+            return None, None, "Polygon last trade missing 'last'"
+        price = last.get("price")
+        ts = last.get("timestamp")
+        if price is None or ts is None:
+            return None, None, "Polygon last trade missing price/timestamp"
+        return float(price), int(ts), None
+    except Exception as e:
+        return None, None, f"last trade error: {type(e).__name__}"
+
+
+async def fetch_aggs_1m(
+    client: httpx.AsyncClient,
+    cfg: TitanConfig,
+    ticker: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    limit: int = 50000,
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """
+    Polygon v2 aggs range endpoint supports {from}/{to} as timestamps (ms) or dates.
+    We use ms to avoid date-boundary ambiguity.
+    """
+    try:
+        url = cfg.aggs_url.format(
+            ticker=ticker,
+            from_=str(_ts_ms(start_utc)),
+            to_=str(_ts_ms(end_utc)),
+        )
+        params = {
+            "adjusted": "true",
+            "sort": "asc",
+            "limit": str(limit),
+        }
+        data = await polygon_get_json(client, url, cfg.polygon_api_key, params=params)
+        results = (data or {}).get("results") or []
+        if not results:
+            return [], None
+        # Each result has: t,o,h,l,c,v,vw,n
+        return results, None
+    except Exception as e:
+        return None, f"aggs error: {type(e).__name__}"
+
+
+async def fetch_options_snapshot_page(
+    client: httpx.AsyncClient,
+    cfg: TitanConfig,
+    underlying: str,
+    next_url: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    try:
+        if next_url:
+            data = await polygon_get_json(client, next_url, cfg.polygon_api_key)
+        else:
+            url = cfg.options_snapshot_url.format(underlying=underlying)
+            # Keep payload manageable; we only need live-ish OI+greeks.
+            params = {"limit": "250"}
+            data = await polygon_get_json(client, url, cfg.polygon_api_key, params=params)
+        return data, None
+    except Exception as e:
+        return None, f"options snapshot error: {type(e).__name__}"
+
+
+# -----------------------------------------------------------------------------
+# Computations (defensive, vectorized)
+
+
+def _format_integrity(spot_valid: bool, spot_age_s: Optional[float], options_age_s: Optional[float], cfg: TitanConfig) -> str:
+    if not spot_valid or spot_age_s is None:
+        return "red"
+    if spot_age_s <= cfg.spot_max_age_s and (options_age_s is not None and options_age_s <= cfg.options_max_age_s):
+        return "green"
+    if spot_age_s <= (cfg.spot_max_age_s * 3):
+        return "amber"
+    return "red"
+
+
+def compute_realized_vol(closings: np.ndarray) -> Optional[float]:
+    if closings.size < 3:
+        return None
+    rets = np.diff(closings) / closings[:-1]
+    if rets.size < 2:
+        return None
+    return float(np.std(rets, ddof=1))
+
+
+def compute_atr_proxy(ohlc: np.ndarray) -> Optional[float]:
+    """
+    ohlc shape: (N, 4) -> O,H,L,C
+    """
+    if ohlc.shape[0] < 3:
+        return None
+    high = ohlc[:, 1]
+    low = ohlc[:, 2]
+    close = ohlc[:, 3]
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
+    return float(np.mean(tr))
+
+
+def compute_exposures_from_snapshot(
+    snapshot_results: List[Dict[str, Any]],
+    spot: float,
+) -> Tuple[Dict[str, Optional[float]], Dict[str, Any], int, Optional[str], Optional[float]]:
+    """
+    Returns:
+      exposures dict: net_gex/net_vex/net_cex/net_delta (None if can't compute)
+      contracts_processed
+      reason_if_degraded
+      options_age_s (None if can't compute)
+    """
+    if not snapshot_results:
+        return (
+            {"net_gex": None, "net_vex": None, "net_cex": None, "net_delta": None},
+            {"gamma_flip": None, "gamma_walls": None, "net_vanna": None, "net_charm": None, "coverage": None, "confidence": None},
+            0,
+            "options snapshot empty",
+            None,
+        )
+
+    # Only use contracts that have OI and greeks.
+    oi = []
+    delta = []
+    gamma = []
+    vega = []
+    iv = []
+    strike = []
+    cp_sign = []  # +1 for call, -1 for put (proxy sign convention)
+    texp_years = []
+    last_updated_ms = []
+
+    now_utc = _utc_now()
+    for row in snapshot_results:
+        details = row.get("details") or {}
+        greeks = row.get("greeks") or {}
+        day = row.get("day") or {}
+
+        # Polygon's snapshot typically provides open_interest at the top-level, but be defensive.
+        open_interest = row.get("open_interest")
+        if open_interest is None:
+            open_interest = day.get("open_interest")
+        if open_interest is None:
+            continue
+
+        contract_type = details.get("contract_type")
+        strike_price = details.get("strike_price")
+        exp = details.get("expiration_date")
+
+        d = greeks.get("delta")
+        g = greeks.get("gamma")
+        v = greeks.get("vega")
+
+        if d is None and g is None and v is None:
+            continue
+
+        oi.append(float(open_interest))
+        delta.append(np.nan if d is None else float(d))
+        gamma.append(np.nan if g is None else float(g))
+        vega.append(np.nan if v is None else float(v))
+
+        # For levels / vanna / charm, we require strike + type + time to expiry (+ IV for vanna/charm).
+        strike.append(np.nan if strike_price is None else float(strike_price))
+        if contract_type == "call":
+            cp_sign.append(1.0)
+        elif contract_type == "put":
+            cp_sign.append(-1.0)
+        else:
+            cp_sign.append(np.nan)
+
+        iv_val = row.get("implied_volatility")
+        iv.append(np.nan if iv_val is None else float(iv_val))
+
+        t_years = np.nan
+        if isinstance(exp, str):
+            try:
+                # expiration_date is YYYY-MM-DD
+                exp_dt = datetime.fromisoformat(exp).replace(tzinfo=timezone.utc)
+                # Treat expiry as end-of-day UTC proxy (model assumption, labeled).
+                exp_dt = exp_dt + timedelta(hours=23, minutes=59, seconds=59)
+                dt_s = (exp_dt - now_utc).total_seconds()
+                if dt_s > 0:
+                    t_years = dt_s / (365.0 * 24.0 * 3600.0)
+            except Exception:
+                t_years = np.nan
+        texp_years.append(t_years)
+
+        lm = row.get("last_updated")
+        if isinstance(lm, int):
+            last_updated_ms.append(lm)
+
+    if not oi:
+        return (
+            {"net_gex": None, "net_vex": None, "net_cex": None, "net_delta": None},
+            {"gamma_flip": None, "gamma_walls": None, "net_vanna": None, "net_charm": None, "coverage": None, "confidence": None},
+            0,
+            "no option contracts with OI+greeks",
+            None,
+        )
+
+    oi_a = np.asarray(oi, dtype=np.float64)
+    d_a = np.asarray(delta, dtype=np.float64)
+    g_a = np.asarray(gamma, dtype=np.float64)
+    v_a = np.asarray(vega, dtype=np.float64)
+    iv_a = np.asarray(iv, dtype=np.float64)
+    k_a = np.asarray(strike, dtype=np.float64)
+    sign_a = np.asarray(cp_sign, dtype=np.float64)
+    t_a = np.asarray(texp_years, dtype=np.float64)
+
+    # Contract multiplier is 100 shares for equity options.
+    multiplier = 100.0
+
+    # net_delta: shares-equivalent exposure (OI * 100 * delta)
+    net_delta = float(np.nansum(oi_a * multiplier * d_a))
+
+    # net_gex: dollar gamma per $1 move (OI*100*gamma*spot^2).
+    # NOTE: This is a standard, conservative definition; it's not "per 1% move" scaled.
+    net_gex = float(np.nansum(oi_a * multiplier * g_a * (spot ** 2)))
+
+    # net_vex: dollar vega per 1 vol point (OI*100*vega).
+    net_vex = float(np.nansum(oi_a * multiplier * v_a))
+
+    # net_cex requires charm (dDelta/dt) which Polygon snapshots do not reliably provide.
+    net_cex = None
+
+    # -----------------------------
+    # Levels (gamma walls + flip) + higher-order proxies (vanna/charm)
+    # IMPORTANT: These are *dealer-exposure proxies*, not true dealer inventory.
+    # Inputs: Polygon OI+greeks(+IV+expiry). Model assumptions are labeled in UI.
+    levels: Dict[str, Any] = {
+        "gamma_flip": None,
+        "gamma_walls": None,
+        "net_vanna": None,
+        "net_charm": None,
+        "coverage": None,
+        "confidence": None,
+    }
+
+    total = int(len(snapshot_results))
+    used_greeks = int(len(oi))
+    used_levels = int(np.sum(np.isfinite(k_a) & np.isfinite(sign_a)))
+    used_model = int(np.sum(np.isfinite(k_a) & np.isfinite(sign_a) & np.isfinite(iv_a) & np.isfinite(t_a) & (t_a > 0) & (iv_a > 0)))
+
+    coverage = {
+        "contracts_total": total,
+        "contracts_used_greeks": used_greeks,
+        "contracts_used_levels": used_levels,
+        "contracts_used_model": used_model,
+        "coverage_greeks": None if total == 0 else float(used_greeks) / float(total),
+        "coverage_levels": None if total == 0 else float(used_levels) / float(total),
+        "coverage_model": None if total == 0 else float(used_model) / float(total),
+        "assumptions": [
+            "Dealer-exposure proxy derived from Polygon OI+greeks (no true dealer book).",
+            "Gamma flip proxy uses call(+)/put(-) sign convention on OI-weighted gamma.",
+            "Charm/Vanna are Black-Scholes proxies using Polygon implied_volatility and time-to-expiry; r=0, q=0.",
+        ],
+    }
+
+    # Confidence heuristic: purely about data coverage + freshness (not forecast certainty).
+    conf = None
+    if coverage["coverage_greeks"] is not None:
+        if coverage["coverage_greeks"] >= 0.70 and (coverage["coverage_model"] or 0.0) >= 0.45:
+            conf = "HIGH"
+        elif coverage["coverage_greeks"] >= 0.45:
+            conf = "MED"
+        else:
+            conf = "LOW"
+
+    levels["coverage"] = coverage
+    levels["confidence"] = conf
+
+    # Gamma walls + flip proxy by strike (call+/put-).
+    strike_mask = np.isfinite(k_a) & np.isfinite(sign_a) & np.isfinite(g_a) & np.isfinite(oi_a)
+    if int(np.sum(strike_mask)) >= 50:
+        strikes = k_a[strike_mask]
+        signed_gex = (oi_a[strike_mask] * multiplier * g_a[strike_mask] * (spot ** 2)) * sign_a[strike_mask]
+        # Aggregate by strike (vectorized using unique)
+        u, inv = np.unique(strikes, return_inverse=True)
+        agg = np.zeros_like(u, dtype=np.float64)
+        np.add.at(agg, inv, signed_gex)
+        # Walls = top abs gamma strikes
+        idx = np.argsort(np.abs(agg))[::-1][:5]
+        walls = [{"strike": float(u[i]), "gex": float(agg[i])} for i in idx if np.isfinite(u[i])]
+        levels["gamma_walls"] = walls
+        # Flip proxy: first crossing of cumulative net gamma across strikes
+        order = np.argsort(u)
+        cum = np.cumsum(agg[order])
+        sgn = np.sign(cum)
+        flip = None
+        for i in range(1, len(sgn)):
+            if sgn[i - 1] == 0:
+                continue
+            if sgn[i] == 0 or sgn[i] == sgn[i - 1]:
+                continue
+            flip = float(u[order[i]])
+            break
+        levels["gamma_flip"] = flip
+
+    # Vanna + Charm proxies (BS, r=0, q=0), if we have IV + T.
+    model_mask = np.isfinite(k_a) & np.isfinite(sign_a) & np.isfinite(iv_a) & np.isfinite(t_a) & (t_a > 0) & (iv_a > 0) & np.isfinite(oi_a)
+    if int(np.sum(model_mask)) >= 100:
+        S = float(spot)
+        K = k_a[model_mask]
+        sig = iv_a[model_mask]
+        T = t_a[model_mask]
+        z = (np.log(np.maximum(S, 1e-12) / np.maximum(K, 1e-12)) + 0.5 * (sig ** 2) * T) / (sig * np.sqrt(T))
+        d1 = z
+        d2 = d1 - sig * np.sqrt(T)
+        phi = (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * (d1 ** 2))
+
+        # Vanna proxy: phi(d1)*sqrt(T)*(1 - d1/(sigma*sqrt(T)))  (r=0,q=0)
+        vanna = phi * np.sqrt(T) * (1.0 - (d1 / (sig * np.sqrt(T))))
+        # Charm proxy (dDelta/dt) with r=0,q=0: phi(d1)*d2/(2T)
+        charm = phi * d2 / (2.0 * T)
+
+        oi_m = oi_a[model_mask]
+        sgn_m = sign_a[model_mask]  # call+/put- proxy
+        levels["net_vanna"] = float(np.nansum(oi_m * multiplier * vanna * sgn_m))
+        levels["net_charm"] = float(np.nansum(oi_m * multiplier * charm * sgn_m))
+
+    age_s = None
+    if last_updated_ms:
+        newest_ms = max(last_updated_ms)
+        age_s = max(0.0, (time.time() * 1000.0 - newest_ms) / 1000.0)
+
+    return (
+        {"net_gex": net_gex, "net_vex": net_vex, "net_cex": net_cex, "net_delta": net_delta},
+        levels,
+        int(len(oi)),
+        None,
+        age_s,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Alerts + Outcomes
+
+
+def insert_alert(db_path: str, payload: Dict[str, Any]) -> int:
+    conn = _db_connect(db_path)
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO alerts (
+              ts, regime, message, trigger_text, scenario, confidence, why_json, levels_json, coverage_json,
+              mood, trade_bias, trade_confidence, trade_logic_json,
+              spot, net_gex, net_vex, net_cex, net_delta,
+              d_gex, d_delta, gamma_flip, net_vanna, net_charm, vol_short, vol_long, vol_rising
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                payload["ts"],
+                payload["regime"],
+                payload["message"],
+                payload.get("trigger_text"),
+                payload.get("scenario"),
+                payload.get("confidence"),
+                json.dumps(payload.get("why") or []),
+                json.dumps(payload.get("levels") or {}),
+                json.dumps(payload.get("coverage") or {}),
+                payload.get("mood"),
+                payload.get("trade_bias"),
+                payload.get("trade_confidence"),
+                json.dumps(payload.get("trade_logic") or []),
+                payload.get("spot"),
+                payload.get("net_gex"),
+                payload.get("net_vex"),
+                payload.get("net_cex"),
+                payload.get("net_delta"),
+                payload.get("d_gex"),
+                payload.get("d_delta"),
+                payload.get("gamma_flip"),
+                payload.get("net_vanna"),
+                payload.get("net_charm"),
+                payload.get("vol_short"),
+                payload.get("vol_long"),
+                None if payload.get("vol_rising") is None else (1 if payload.get("vol_rising") else 0),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def fetch_alerts(db_path: str, limit: int) -> List[Dict[str, Any]]:
+    conn = _db_connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, ts, regime, message, trigger_text, scenario, confidence, why_json, levels_json, coverage_json,
+                   mood, trade_bias, trade_confidence, trade_logic_json,
+                   gamma_flip, net_vanna, net_charm, spot
+            FROM alerts
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "id": r["id"],
+                    "ts": r["ts"],
+                    "regime": r["regime"],
+                    "message": r["message"],
+                    "trigger_text": r["trigger_text"],
+                    "scenario": r["scenario"],
+                    "confidence": r["confidence"],
+                    "why": json.loads(r["why_json"] or "[]"),
+                    "levels": json.loads(r["levels_json"] or "{}"),
+                    "coverage": json.loads(r["coverage_json"] or "{}"),
+                    "mood": r["mood"],
+                    "trade_bias": r["trade_bias"],
+                    "trade_confidence": r["trade_confidence"],
+                    "trade_logic": json.loads(r["trade_logic_json"] or "[]"),
+                    "gamma_flip": r["gamma_flip"],
+                    "net_vanna": r["net_vanna"],
+                    "net_charm": r["net_charm"],
+                    "spot": r["spot"],
+                }
+            )
+        return out
+    finally:
+        conn.close()
+
+
+def compute_stats(db_path: str) -> Dict[str, Any]:
+    conn = _db_connect(db_path)
+    try:
+        # Aggregate hit-rate by regime + horizon
+        rows = conn.execute(
+            """
+            SELECT a.regime AS regime,
+                   o.horizon_minutes AS horizon_minutes,
+                   COUNT(*) AS n,
+                   SUM(o.moved_15pt_equiv) AS hits
+            FROM outcomes o
+            JOIN alerts a ON a.id = o.alert_id
+            WHERE a.regime IN ('PRE','FLUSH','CHARM')
+              AND o.horizon_minutes IN (30,60)
+            GROUP BY a.regime, o.horizon_minutes
+            """
+        ).fetchall()
+
+        # Initialize structure
+        stats: Dict[str, Any] = {
+            "asof": _iso(_utc_now()),
+            "by_regime": {
+                "PRE": {"30m": {"hit_rate": None, "n": 0}, "60m": {"hit_rate": None, "n": 0}},
+                "FLUSH": {"30m": {"hit_rate": None, "n": 0}, "60m": {"hit_rate": None, "n": 0}},
+                "CHARM": {"30m": {"hit_rate": None, "n": 0}, "60m": {"hit_rate": None, "n": 0}},
+            },
+        }
+        for r in rows:
+            regime = r["regime"]
+            horizon = int(r["horizon_minutes"])
+            n = int(r["n"] or 0)
+            hits = int(r["hits"] or 0)
+            key = "30m" if horizon == 30 else "60m"
+            stats["by_regime"][regime][key]["n"] = n
+            stats["by_regime"][regime][key]["hit_rate"] = None if n == 0 else float(hits) / float(n)
+
+        # Convenience fields matching the requested shape (still backed by the same DB rows).
+        stats["summary"] = {}
+        for regime in ("PRE", "FLUSH", "CHARM"):
+            r30 = stats["by_regime"][regime]["30m"]
+            r60 = stats["by_regime"][regime]["60m"]
+            stats["summary"][regime] = {
+                "hit_rate_30m": r30["hit_rate"],
+                "hit_rate_60m": r60["hit_rate"],
+                "n_30m": r30["n"],
+                "n_60m": r60["n"],
+            }
+        return stats
+    finally:
+        conn.close()
+
+
+def _pct(x: float) -> float:
+    return 100.0 * x
+
+
+def compute_market_mood_and_trade(
+    *,
+    spot: Optional[float],
+    spot_valid: bool,
+    vol_rising: Optional[bool],
+    net_gex: Optional[float],
+    d_delta: Optional[float],
+    d_delta_thr: Optional[float],
+    spot_stall: Optional[bool],
+    levels: Dict[str, Any],
+    data_confidence: Optional[str],
+) -> Tuple[Optional[str], Optional[str], Optional[float], List[str]]:
+    """
+    Polygon-only weighted sync model:
+    - Inputs: spot, vol regime, d_delta accel, gamma sign, gamma walls proximity (+ optional stall).
+    - Output: mood + trade bias + trade confidence + transparent reasoning bullets.
+
+    NOTE:
+    - data_confidence is coverage quality (HIGH/MED/LOW).
+    - trade_confidence is signal alignment confidence (0-100), capped by data_confidence.
+    """
+    if spot is None or not spot_valid:
+        return "UNKNOWN", None, None, ["N/A: spot invalid or missing"]
+
+    logic: List[str] = []
+
+    # Mood: classic microstructure proxy using vol regime + gamma sign.
+    if vol_rising is True:
+        mood = "TREND" if (net_gex is None or net_gex < 0) else "VOL_EXPANSION"
+    elif vol_rising is False:
+        mood = "MEAN_REVERT" if (net_gex is not None and net_gex > 0) else "CHOP"
+    else:
+        mood = "UNKNOWN"
+
+    # Weights adapt to mood (range/moods sync)
+    if mood in ("TREND", "VOL_EXPANSION"):
+        w_flow, w_gamma, w_levels, w_micro = 0.42, 0.25, 0.18, 0.15
+    elif mood == "MEAN_REVERT":
+        w_flow, w_gamma, w_levels, w_micro = 0.25, 0.35, 0.25, 0.15
+    else:
+        w_flow, w_gamma, w_levels, w_micro = 0.25, 0.25, 0.25, 0.25
+
+    # Flow acceleration strength (d_delta vs rolling threshold)
+    flow_strength = None
+    if d_delta is not None and d_delta_thr is not None and d_delta_thr > 0:
+        flow_strength = min(2.0, abs(d_delta) / float(d_delta_thr))  # 0..2
+        logic.append(f"Flow accel: abs(d_delta)/thr={flow_strength:.2f}x (thr=p90 rolling)")
+    else:
+        logic.append("Flow accel: N/A (insufficient d_delta history)")
+
+    # Gamma sign availability
+    gamma_present = net_gex is not None
+    if gamma_present:
+        logic.append(f"Gamma sign (proxy): {'+' if net_gex>0 else ('-' if net_gex<0 else '0')} (net_gex)")
+    else:
+        logic.append("Gamma sign (proxy): N/A (options greeks missing)")
+
+    # Gamma walls proximity (top-3)
+    levels_score = None
+    walls = (levels or {}).get("gamma_walls") or []
+    if isinstance(walls, list) and walls:
+        strikes: List[float] = []
+        for w in walls[:3]:
+            try:
+                strikes.append(float(w["strike"]))
+            except Exception:
+                pass
+        if strikes:
+            dist = min(abs(float(spot) - s) / max(1e-9, float(spot)) for s in strikes)
+            if dist <= 0.0025:
+                levels_score = 1.0
+            elif dist <= 0.0050:
+                levels_score = 0.6
+            else:
+                levels_score = 0.2
+            logic.append(f"Levels: near top gamma wall (dist={_pct(dist):.2f}%)")
+    if levels_score is None:
+        logic.append("Levels: N/A (gamma walls unavailable)")
+
+    # Microstructure confirmations
+    micro = 0.0
+    if vol_rising is True:
+        micro += 1.0
+        logic.append("Vol regime: rising (range expansion risk)")
+    elif vol_rising is False:
+        micro += 0.8
+        logic.append("Vol regime: not rising (range compression / mean reversion more likely)")
+    else:
+        logic.append("Vol regime: N/A")
+
+    if spot_stall is True:
+        micro += 0.5
+        logic.append("Spot: stalled (early pressure building)")
+
+    # Bias: directional when trend + negative gamma + flow sign; otherwise mean-revert/wait.
+    trade_bias: Optional[str]
+    if mood in ("TREND", "VOL_EXPANSION") and gamma_present and d_delta is not None:
+        if net_gex < 0 and d_delta < 0:
+            trade_bias = "DOWN"
+        elif net_gex < 0 and d_delta > 0:
+            trade_bias = "UP"
+        else:
+            trade_bias = "WAIT"
+    elif mood == "MEAN_REVERT":
+        trade_bias = "MEAN_REVERT"
+    else:
+        trade_bias = "WAIT"
+
+    # Build confidence from available features (no synthetic fill)
+    parts = []
+    if flow_strength is not None:
+        parts.append(w_flow * min(1.0, flow_strength / 2.0))
+    if gamma_present:
+        parts.append(w_gamma * 1.0)
+    if levels_score is not None:
+        parts.append(w_levels * levels_score)
+    if micro > 0:
+        parts.append(w_micro * min(1.0, micro / 1.5))
+
+    if not parts:
+        return mood, trade_bias, None, logic + ["Trade confidence: N/A (missing inputs)"]
+
+    raw = float(np.sum(np.asarray(parts, dtype=np.float64)))
+    raw = max(0.0, min(1.0, raw))
+
+    # Cap by data coverage confidence (still keep separate labels)
+    cap = 0.70
+    if data_confidence == "HIGH":
+        cap = 0.95
+    elif data_confidence == "MED":
+        cap = 0.85
+    elif data_confidence == "LOW":
+        cap = 0.75
+
+    conf = min(cap, raw)
+    trade_confidence = float(round(100.0 * conf, 1))
+    logic.append(f"Trade confidence: {trade_confidence:.1f}/100 (cap by data coverage={data_confidence or 'N/A'})")
+    logic.append(f"Trade bias: {trade_bias}")
+    return mood, trade_bias, trade_confidence, logic
+
+
+def outcomes_missing_for_alert(conn: sqlite3.Connection, alert_id: int, horizon: int) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM outcomes WHERE alert_id=? AND horizon_minutes=?",
+        (alert_id, horizon),
+    ).fetchone()
+    return row is None
+
+
+async def evaluate_alert_outcomes(
+    client: httpx.AsyncClient,
+    cfg: TitanConfig,
+    alert_row: sqlite3.Row,
+) -> List[Tuple[int, int, int, Optional[float], Optional[float], str]]:
+    """
+    Returns list of rows to upsert into outcomes:
+      (alert_id, horizon_minutes, moved_15pt_equiv, max_favor, max_adverse, evaluated_ts)
+    """
+    alert_id = int(alert_row["id"])
+    ts = datetime.fromisoformat(alert_row["ts"]).astimezone(timezone.utc)
+    spot_at_alert = alert_row["spot"]
+    if spot_at_alert is None:
+        # Without spot, we still try to evaluate using first bar close; if no bars -> N/A (skip insert).
+        pass
+
+    evaluated_ts = _iso(_utc_now())
+
+    # Mapping rule (Polygon-only, no synthetic fallback):
+    # We map 15 SPX points to SPY points via ratio SPY/SPX using Polygon last-trade for both.
+    spy_price_now, _, _ = await fetch_last_trade(client, cfg, cfg.spot_symbol)
+    spx_price, _, _ = await fetch_last_trade(client, cfg, "I:SPX")
+    if spy_price_now is None or spx_price is None or not (float(spx_price) > 0):
+        # Cannot evaluate without real mapping inputs; do not insert synthetic outcomes.
+        return []
+    spy_threshold = 15.0 * (float(spy_price_now) / float(spx_price))
+
+    rows_to_insert: List[Tuple[int, int, int, Optional[float], Optional[float], str]] = []
+    for horizon in (30, 60):
+        end = ts + timedelta(minutes=horizon)
+        aggs, err = await fetch_aggs_1m(client, cfg, cfg.spot_symbol, ts, end)
+        if aggs is None:
+            # Can't evaluate horizon; do not insert synthetic outcomes.
+            continue
+        if not aggs:
+            continue
+
+        closes = np.asarray([float(x["c"]) for x in aggs if x.get("c") is not None], dtype=np.float64)
+        if closes.size < 2:
+            continue
+
+        base = float(spot_at_alert) if spot_at_alert is not None else float(closes[0])
+        max_up = float(np.max(closes) - base)
+        max_down = float(np.min(closes) - base)  # negative or 0
+        moved = 1 if max(max_up, abs(max_down)) >= float(spy_threshold) else 0
+        rows_to_insert.append((alert_id, horizon, moved, max_up, max_down, evaluated_ts))
+
+    return rows_to_insert
+
+
+# -----------------------------------------------------------------------------
+# Engine
+
+
+class TitanEngine:
+    def __init__(self, cfg: TitanConfig):
+        self.cfg = cfg
+        self._spot_hist: Deque[Tuple[float, float]] = deque(maxlen=6000)  # (ts_s, price)
+        self._exposure_hist: Deque[Tuple[float, float, float]] = deque(maxlen=6000)  # (ts_s, net_gex, net_delta)
+        self._deriv_hist: Deque[Tuple[float, float, float]] = deque(maxlen=6000)  # (ts_s, d_gex, d_delta)
+        self._last_log_s = 0.0
+        self._last_pre_s = 0.0
+        self._last_flush_s = 0.0
+        self._last_charm_s = 0.0
+        self._last_emit_id: Optional[int] = None
+        self._last_aggs_fetch_s = 0.0
+        self._last_options_fetch_s = 0.0
+        self._cached_aggs: Optional[List[Dict[str, Any]]] = None
+        self._cached_aggs_err: Optional[str] = None
+        self._cached_options: Optional[List[Dict[str, Any]]] = None
+        self._cached_options_err: Optional[str] = None
+
+    def _update_series(self, now: datetime, spot: float, vol_short: Optional[float], vol_long: Optional[float]) -> None:
+        # Keep small series for UI streaming.
+        ms = _ts_ms(now)
+        GLOBAL_STATE["spot_series"] = (GLOBAL_STATE.get("spot_series") or [])[-1200:]
+        GLOBAL_STATE["spot_series"].append({"ts_ms": ms, "price": spot})
+        if vol_short is not None or vol_long is not None:
+            GLOBAL_STATE["vol_series"] = (GLOBAL_STATE.get("vol_series") or [])[-1200:]
+            GLOBAL_STATE["vol_series"].append({"ts_ms": ms, "vol_short": vol_short, "vol_long": vol_long})
+
+    def _compute_derivatives(self, now_s: float, net_gex: Optional[float], net_delta: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+        if net_gex is None or net_delta is None:
+            return None, None
+        if not self._exposure_hist:
+            self._exposure_hist.append((now_s, net_gex, net_delta))
+            return None, None
+        prev_t, prev_gex, prev_delta = self._exposure_hist[-1]
+        dt = max(1e-6, now_s - prev_t)
+        d_gex = (net_gex - prev_gex) / dt
+        d_delta = (net_delta - prev_delta) / dt
+        self._exposure_hist.append((now_s, net_gex, net_delta))
+        self._deriv_hist.append((now_s, float(d_gex), float(d_delta)))
+        return float(d_gex), float(d_delta)
+
+    def _spot_stall(self, now_s: float, spot: float) -> Tuple[Optional[bool], Optional[float]]:
+        if not self._spot_hist:
+            return None, None
+        lookback = self.cfg.spot_stall_lookback_s
+        target_t = now_s - float(lookback)
+        # Find the closest point <= target_t from the right.
+        spot_then = None
+        for t, p in reversed(self._spot_hist):
+            if t <= target_t:
+                spot_then = p
+                break
+        if spot_then is None:
+            return None, None
+        frac = abs(spot - spot_then) / max(1e-9, spot_then)
+        return bool(frac < self.cfg.spot_stall_threshold_frac), float(frac)
+
+    def _d_delta_threshold(self, now_s: float) -> Optional[float]:
+        window_s = float(self.cfg.deriv_window_minutes) * 60.0
+        cutoff = now_s - window_s
+        if len(self._deriv_hist) < 5:
+            return None
+        recent = [abs(dd) for (t, _, dd) in self._deriv_hist if t >= cutoff and dd is not None]
+        if len(recent) < 20:
+            return None
+        return float(np.percentile(np.asarray(recent, dtype=np.float64), self.cfg.d_delta_percentile))
+
+    def _scenario_text(
+        self,
+        regime: str,
+        net_gex: Optional[float],
+        d_delta: Optional[float],
+        vol_rising: Optional[bool],
+        spot_stall: Optional[bool],
+    ) -> Optional[str]:
+        # Polygon-only computed heuristics; always presented as "likely", never as certainty.
+        if regime == "PRE":
+            if d_delta is None:
+                return "Likely move risk building, but d_delta unavailable."
+            if d_delta > 0:
+                return "Likely UP risk: accelerating hedging demand while spot stalls."
+            return "Likely DOWN risk: accelerating hedge selling pressure while spot stalls."
+        if regime == "FLUSH":
+            return "Likely downside continuation: vol expansion + destabilizing hedging flow."
+        if regime == "CHARM":
+            return "Likely mean-reversion: stabilizing flow with supportive gamma profile."
+        # Neutral context
+        if vol_rising is True:
+            return "Neutral, but vol is rising: expect wider swings; wait for confirmation."
+        if net_gex is not None and net_gex > 0:
+            return "Neutral, slight mean-reversion bias (positive gamma profile)."
+        if net_gex is not None and net_gex < 0:
+            return "Neutral, higher trend risk (negative gamma profile)."
+        return None
+
+    def _should_emit(self, regime: str) -> bool:
+        now_s = time.time()
+        if regime == "PRE":
+            return (now_s - self._last_pre_s) >= float(self.cfg.pre_cooldown_s)
+        if regime == "FLUSH":
+            return (now_s - self._last_flush_s) >= float(self.cfg.flush_cooldown_s)
+        if regime == "CHARM":
+            return (now_s - self._last_charm_s) >= float(self.cfg.charm_cooldown_s)
+        return True
+
+    def _mark_emit(self, regime: str) -> None:
+        now_s = time.time()
+        if regime == "PRE":
+            self._last_pre_s = now_s
+        elif regime == "FLUSH":
+            self._last_flush_s = now_s
+        elif regime == "CHARM":
+            self._last_charm_s = now_s
+
+    async def run_forever(self) -> None:
+        cfg = self.cfg
+        migrate_sqlite(cfg.db_path)
+
+        async with httpx.AsyncClient() as client:
+            while True:
+                t0 = time.perf_counter()
+                loop_reason: Optional[str] = None
+
+                # Holiday-safe: rely on Polygon market status. Also handle Dec 25 explicitly.
+                now = _utc_now()
+                if now.month == 12 and now.day == 25:
+                    GLOBAL_STATE["market_session"] = "CLOSED"
+                    GLOBAL_STATE["engine_status"] = "MARKET_CLOSED"
+                    GLOBAL_STATE["engine_reason"] = "Holiday (Dec 25)"
+                    await asyncio.sleep(max(5.0, cfg.poll_s))
+                    continue
+
+                market_session, market_reason = await fetch_market_session(client, cfg)
+                GLOBAL_STATE["market_session"] = market_session
+                if market_session == "UNKNOWN" and market_reason:
+                    loop_reason = market_reason
+
+                if market_session == "CLOSED":
+                    GLOBAL_STATE["engine_status"] = "MARKET_CLOSED"
+                    GLOBAL_STATE["engine_reason"] = "Market closed"
+                    # Do not compute; UI must show archive instead.
+                    await asyncio.sleep(max(5.0, cfg.poll_s))
+                    continue
+
+                # Spot
+                spot, spot_ts_ms, spot_err = await fetch_last_trade(client, cfg, cfg.spot_symbol)
+                if spot is None or spot_ts_ms is None:
+                    GLOBAL_STATE["spot"] = None
+                    GLOBAL_STATE["spot_valid"] = False
+                    GLOBAL_STATE["spot_age_s"] = None
+                    GLOBAL_STATE["engine_status"] = "DEGRADED"
+                    GLOBAL_STATE["engine_reason"] = spot_err or "spot missing"
+                    await asyncio.sleep(cfg.poll_s)
+                    continue
+
+                now_ms = int(time.time() * 1000.0)
+                spot_age_s = max(0.0, (now_ms - int(spot_ts_ms)) / 1000.0)
+                GLOBAL_STATE["spot"] = float(spot)
+                GLOBAL_STATE["spot_valid"] = bool(spot_age_s <= (cfg.spot_max_age_s * 6))
+                GLOBAL_STATE["spot_age_s"] = float(spot_age_s)
+
+                now_s = time.time()
+                self._spot_hist.append((now_s, float(spot)))
+
+                # Vol regime from 1m aggs (last 60 minutes), cached to stay smooth.
+                if (now_s - self._last_aggs_fetch_s) >= 15.0 or self._cached_aggs is None:
+                    self._last_aggs_fetch_s = now_s
+                    self._cached_aggs, self._cached_aggs_err = await fetch_aggs_1m(
+                        client,
+                        cfg,
+                        cfg.spot_symbol,
+                        now - timedelta(minutes=65),
+                        now,
+                    )
+                aggs, aggs_err = self._cached_aggs, self._cached_aggs_err
+                vol_short = None
+                vol_long = None
+                vol_rising = None
+                if aggs is not None and aggs:
+                    closes = np.asarray([float(x["c"]) for x in aggs if x.get("c") is not None], dtype=np.float64)
+                    if closes.size:
+                        GLOBAL_STATE["last_close"] = float(closes[-1])
+                    ohlc = np.asarray(
+                        [[float(x["o"]), float(x["h"]), float(x["l"]), float(x["c"])] for x in aggs if x.get("c") is not None],
+                        dtype=np.float64,
+                    )
+                    # Use last 5 and last 30 minutes
+                    vol_short = compute_realized_vol(closes[-6:])  # ~5 returns
+                    vol_long = compute_realized_vol(closes[-31:])
+                    atr_short = compute_atr_proxy(ohlc[-6:])
+                    atr_long = compute_atr_proxy(ohlc[-31:])
+                    if vol_short is not None and vol_long is not None:
+                        vol_rising = bool(vol_short > vol_long)
+                    elif atr_short is not None and atr_long is not None:
+                        vol_rising = bool(atr_short > atr_long)
+                else:
+                    loop_reason = aggs_err or "missing aggs"
+
+                GLOBAL_STATE["vol_short"] = vol_short
+                GLOBAL_STATE["vol_long"] = vol_long
+                GLOBAL_STATE["vol_rising"] = vol_rising
+
+                # Options snapshot -> exposures (cached to reduce API load; still Polygon realtime).
+                snap_err = None
+                snapshot_results: List[Dict[str, Any]] = []
+                options_age_s = None
+                if (now_s - self._last_options_fetch_s) >= 10.0 or self._cached_options is None:
+                    self._last_options_fetch_s = now_s
+                    snap_first, snap_err = await fetch_options_snapshot_page(client, cfg, cfg.options_underlying)
+                    snapshot_results = []
+                    next_url = None
+                    if snap_first and isinstance(snap_first, dict):
+                        snapshot_results.extend(snap_first.get("results") or [])
+                        next_url = snap_first.get("next_url")
+                    else:
+                        snap_err = snap_err or "options snapshot missing"
+
+                    # Pull up to 3 pages max to avoid heavy loops.
+                    pages = 1
+                    while next_url and pages < 3:
+                        snap, _err = await fetch_options_snapshot_page(client, cfg, cfg.options_underlying, next_url=next_url)
+                        if not snap or not isinstance(snap, dict):
+                            break
+                        snapshot_results.extend(snap.get("results") or [])
+                        next_url = snap.get("next_url")
+                        pages += 1
+
+                    self._cached_options = snapshot_results
+                    self._cached_options_err = snap_err
+                else:
+                    snapshot_results = self._cached_options or []
+                    snap_err = self._cached_options_err
+
+                exposures_t0 = time.perf_counter()
+                exposures, levels, n_contracts, exp_reason, options_age_s = compute_exposures_from_snapshot(
+                    snapshot_results, float(spot)
+                )
+                GLOBAL_STATE["exposures_ms"] = float((time.perf_counter() - exposures_t0) * 1000.0)
+                GLOBAL_STATE["contracts_processed"] = int(n_contracts)
+                GLOBAL_STATE["options_age_s"] = options_age_s
+
+                GLOBAL_STATE["net_gex"] = exposures.get("net_gex")
+                GLOBAL_STATE["net_vex"] = exposures.get("net_vex")
+                GLOBAL_STATE["net_cex"] = exposures.get("net_cex")
+                GLOBAL_STATE["net_delta"] = exposures.get("net_delta")
+                GLOBAL_STATE["gamma_flip"] = levels.get("gamma_flip")
+                GLOBAL_STATE["gamma_walls"] = levels.get("gamma_walls")
+                GLOBAL_STATE["net_vanna"] = levels.get("net_vanna")
+                GLOBAL_STATE["net_charm"] = levels.get("net_charm")
+                GLOBAL_STATE["coverage"] = levels.get("coverage")
+                GLOBAL_STATE["confidence"] = levels.get("confidence")
+
+                d_gex, d_delta = self._compute_derivatives(now_s, exposures.get("net_gex"), exposures.get("net_delta"))
+                GLOBAL_STATE["d_gex"] = d_gex
+                GLOBAL_STATE["d_delta"] = d_delta
+
+                stall, stall_frac = self._spot_stall(now_s, float(spot))
+                d_delta_thr = self._d_delta_threshold(now_s)
+
+                mood, trade_bias, trade_conf, trade_logic = compute_market_mood_and_trade(
+                    spot=float(spot),
+                    spot_valid=bool(GLOBAL_STATE["spot_valid"]),
+                    vol_rising=vol_rising,
+                    net_gex=exposures.get("net_gex"),
+                    d_delta=d_delta,
+                    d_delta_thr=d_delta_thr,
+                    spot_stall=stall,
+                    levels=levels,
+                    data_confidence=levels.get("confidence"),
+                )
+                GLOBAL_STATE["mood"] = mood
+                GLOBAL_STATE["trade_bias"] = trade_bias
+                GLOBAL_STATE["trade_confidence"] = trade_conf
+                GLOBAL_STATE["trade_logic"] = trade_logic
+
+                # Determine engine health
+                if not GLOBAL_STATE["spot_valid"]:
+                    GLOBAL_STATE["engine_status"] = "DEGRADED"
+                    GLOBAL_STATE["engine_reason"] = "spot stale"
+                elif exp_reason is not None:
+                    GLOBAL_STATE["engine_status"] = "DEGRADED"
+                    GLOBAL_STATE["engine_reason"] = exp_reason
+                elif snap_err is not None and not snapshot_results:
+                    GLOBAL_STATE["engine_status"] = "DEGRADED"
+                    GLOBAL_STATE["engine_reason"] = snap_err
+                else:
+                    GLOBAL_STATE["engine_status"] = "OK"
+                    GLOBAL_STATE["engine_reason"] = loop_reason
+
+                GLOBAL_STATE["data_integrity"] = _format_integrity(
+                    GLOBAL_STATE["spot_valid"],
+                    GLOBAL_STATE["spot_age_s"],
+                    GLOBAL_STATE["options_age_s"],
+                    cfg,
+                )
+
+                # Timestamp fields for UI (NY time formatting is done client-side)
+                GLOBAL_STATE["last_tick_ny"] = spot_ts_ms
+                GLOBAL_STATE["latency_ms"] = int(spot_age_s * 1000.0)
+
+                self._update_series(now, float(spot), vol_short, vol_long)
+
+                # Alert logic (defensive, no synthetic values)
+                why: List[str] = []
+                regime = "NEUTRAL"
+                trigger_text = "NEUTRAL: Wait for structure."
+                message = None
+                scenario = None
+
+                # PRE: d_delta acceleration above rolling percentile + spot stall
+                if (
+                    d_delta is not None
+                    and stall is True
+                    and d_delta_thr is not None
+                    and abs(d_delta) > float(d_delta_thr)
+                ):
+                    regime = "PRE"
+                    trigger_text = "STAY SHARP: Hedge pressure building."
+                    direction = "UP" if d_delta > 0 else "DOWN"
+                    message = f"HEDGE PRESSURE BUILDING: Delta hedging accelerating while spot stalls ({direction} pressure)."
+                    why = [
+                        f"abs(d_delta)={abs(d_delta):.2f} > p{cfg.d_delta_percentile:.0f}={d_delta_thr:.2f}",
+                        f"spot_stall=True (30s move={stall_frac:.5f})",
+                    ]
+                    if levels.get("gamma_flip") is not None:
+                        why.append(f"gamma_flip_proxy={levels['gamma_flip']:.2f} (call+/put- OI-gamma)")
+                    if levels.get("net_charm") is not None:
+                        why.append(f"charm_proxy={levels['net_charm']:.2f} (BS, IV from Polygon)")
+                    if levels.get("net_vanna") is not None:
+                        why.append(f"vanna_proxy={levels['net_vanna']:.2f} (BS, IV from Polygon)")
+                    scenario = self._scenario_text(regime, exposures.get("net_gex"), d_delta, vol_rising, stall)
+
+                # FLUSH: only if vol_rising true
+                # Heuristic: negative net_gex + downside acceleration (d_delta negative) suggests forced dealer selling.
+                if (
+                    message is None
+                    and vol_rising is True
+                    and exposures.get("net_gex") is not None
+                    and exposures.get("net_delta") is not None
+                    and d_delta is not None
+                    and exposures["net_gex"] < 0
+                    and d_delta < 0
+                    and abs(d_delta) > (d_delta_thr or 0.0)
+                ):
+                    regime = "FLUSH"
+                    trigger_text = "FADE THE RIP: Forced Dealer Selling."
+                    message = "FLUSH: Vol rising with negative gamma and accelerating delta-hedge selling."
+                    why = [
+                        "vol_rising=True (anti-chop filter)",
+                        "net_gex<0 (short gamma)",
+                        "d_delta<0 (hedge selling accelerating)",
+                    ]
+                    if levels.get("gamma_walls"):
+                        top = levels["gamma_walls"][0]
+                        why.append(f"top_gamma_wall_proxy={top['strike']:.2f}")
+                    scenario = self._scenario_text(regime, exposures.get("net_gex"), d_delta, vol_rising, stall)
+
+                # CHARM: only if vol_rising false OR mean-reverting (optional)
+                # Heuristic: positive net_gex + non-rising vol + stabilizing d_delta -> time-decay support.
+                if (
+                    message is None
+                    and (vol_rising is False or vol_rising is None)
+                    and exposures.get("net_gex") is not None
+                    and exposures["net_gex"] > 0
+                    and d_delta is not None
+                    and abs(d_delta) < (d_delta_thr or float("inf"))
+                ):
+                    regime = "CHARM"
+                    trigger_text = "BUY THE DIP: Time-Decay Support."
+                    message = "CHARM: Vol not rising with positive gamma and stabilizing hedging flow."
+                    why = [
+                        "vol_rising=False (chop/mean-reversion allowed)",
+                        "net_gex>0 (long gamma support)",
+                        "abs(d_delta) below acceleration threshold",
+                    ]
+                    if levels.get("gamma_walls"):
+                        top = levels["gamma_walls"][0]
+                        why.append(f"top_gamma_wall_proxy={top['strike']:.2f}")
+                    scenario = self._scenario_text(regime, exposures.get("net_gex"), d_delta, vol_rising, stall)
+
+                # Emit alert (with cooldown, and only if computed inputs exist)
+                if message is not None and self._should_emit(regime):
+                    self._mark_emit(regime)
+                    alert_payload = {
+                        "ts": _iso(now),
+                        "regime": regime,
+                        "message": message,
+                        "trigger_text": trigger_text,
+                        "scenario": scenario,
+                        "confidence": levels.get("confidence"),
+                        "mood": mood,
+                        "trade_bias": trade_bias,
+                        "trade_confidence": trade_conf,
+                        "why": why,
+                        "levels": {
+                            "gamma_flip": levels.get("gamma_flip"),
+                            "gamma_walls": levels.get("gamma_walls"),
+                            "net_vanna": levels.get("net_vanna"),
+                            "net_charm": levels.get("net_charm"),
+                        },
+                        "coverage": levels.get("coverage"),
+                        "trade_logic": trade_logic,
+                        "spot": float(spot),
+                        "net_gex": exposures.get("net_gex"),
+                        "net_vex": exposures.get("net_vex"),
+                        "net_cex": exposures.get("net_cex"),
+                        "net_delta": exposures.get("net_delta"),
+                        "d_gex": d_gex,
+                        "d_delta": d_delta,
+                        "gamma_flip": levels.get("gamma_flip"),
+                        "net_vanna": levels.get("net_vanna"),
+                        "net_charm": levels.get("net_charm"),
+                        "vol_short": vol_short,
+                        "vol_long": vol_long,
+                        "vol_rising": vol_rising,
+                    }
+                    alert_id = insert_alert(cfg.db_path, alert_payload)
+                    self._last_emit_id = alert_id
+                    GLOBAL_STATE["last_alert_id"] = alert_id
+                    GLOBAL_STATE["regime"] = regime
+                    GLOBAL_STATE["trigger_text"] = trigger_text
+                    GLOBAL_STATE["why"] = why
+                    GLOBAL_STATE["scenario"] = scenario
+                else:
+                    GLOBAL_STATE["regime"] = regime
+                    GLOBAL_STATE["trigger_text"] = trigger_text
+                    GLOBAL_STATE["why"] = why
+                    GLOBAL_STATE["scenario"] = self._scenario_text(regime, exposures.get("net_gex"), d_delta, vol_rising, stall)
+
+                # Periodic log (max 1/min)
+                now_log = time.time()
+                if now_log - self._last_log_s >= 60.0:
+                    self._last_log_s = now_log
+                    logger.info(
+                        "status=%s session=%s spot=%s spot_age=%.1fs opt_age=%s integrity=%s regime=%s last_alert=%s",
+                        GLOBAL_STATE.get("engine_status"),
+                        GLOBAL_STATE.get("market_session"),
+                        GLOBAL_STATE.get("spot"),
+                        GLOBAL_STATE.get("spot_age_s") or -1.0,
+                        GLOBAL_STATE.get("options_age_s"),
+                        GLOBAL_STATE.get("data_integrity"),
+                        GLOBAL_STATE.get("regime"),
+                        GLOBAL_STATE.get("last_alert_id"),
+                    )
+
+                GLOBAL_STATE["loop_ms"] = float((time.perf_counter() - t0) * 1000.0)
+                await asyncio.sleep(cfg.poll_s)
+
+
+async def outcomes_evaluator_forever(cfg: TitanConfig) -> None:
+    migrate_sqlite(cfg.db_path)
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                conn = _db_connect(cfg.db_path)
+                try:
+                    # Find alerts older than 60m and missing at least one outcome row.
+                    cutoff = _utc_now() - timedelta(minutes=65)
+                    rows = conn.execute(
+                        """
+                        SELECT id, ts, spot
+                        FROM alerts
+                        WHERE ts <= ?
+                          AND regime IN ('PRE','FLUSH','CHARM')
+                        ORDER BY id DESC
+                        LIMIT 50
+                        """,
+                        (_iso(cutoff),),
+                    ).fetchall()
+
+                    for r in rows:
+                        alert_id = int(r["id"])
+                        for horizon in (30, 60):
+                            if outcomes_missing_for_alert(conn, alert_id, horizon):
+                                to_insert = await evaluate_alert_outcomes(client, cfg, r)
+                                if not to_insert:
+                                    continue
+                                for (aid, hm, moved, mf, ma, ets) in to_insert:
+                                    conn.execute(
+                                        """
+                                        INSERT OR REPLACE INTO outcomes (
+                                          alert_id, horizon_minutes, moved_15pt_equiv,
+                                          max_favor, max_adverse, evaluated_ts
+                                        ) VALUES (?,?,?,?,?,?)
+                                        """,
+                                        (aid, hm, moved, mf, ma, ets),
+                                    )
+                                conn.commit()
+                finally:
+                    conn.close()
+            except Exception:
+                logger.exception("outcomes evaluator error")
+
+            await asyncio.sleep(cfg.evaluator_poll_s)
+
+
+# -----------------------------------------------------------------------------
+# FastAPI app
+
+
+def build_app(cfg: TitanConfig) -> FastAPI:
+    app = FastAPI(title="TITAN OMEGA v17.5", version="17.5")
+
+    static_dir = cfg.static_dir
+    if os.path.isdir(static_dir):
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        logging.basicConfig(
+            level=os.getenv("TITAN_LOG_LEVEL", "INFO").upper(),
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+        migrate_sqlite(cfg.db_path)
+        asyncio.create_task(TitanEngine(cfg).run_forever())
+        asyncio.create_task(outcomes_evaluator_forever(cfg))
+
+    @app.get("/", response_class=HTMLResponse)
+    async def index() -> str:
+        # Serve the terminal UI
+        html_path = os.path.join(cfg.static_dir, "titan_terminal.html")
+        if not os.path.exists(html_path):
+            return "<h2>TITAN terminal UI missing</h2>"
+        with open(html_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    @app.get("/health")
+    async def health() -> JSONResponse:
+        # Extended fields
+        return JSONResponse(
+            {
+                "engine_status": GLOBAL_STATE.get("engine_status"),
+                "engine_reason": GLOBAL_STATE.get("engine_reason"),
+                "market_session": GLOBAL_STATE.get("market_session"),
+                "ws_ok": GLOBAL_STATE.get("ws_ok"),
+                "spot_valid": GLOBAL_STATE.get("spot_valid"),
+                "spot_age_s": GLOBAL_STATE.get("spot_age_s"),
+                "last_close": GLOBAL_STATE.get("last_close"),
+                "options_age_s": GLOBAL_STATE.get("options_age_s"),
+                "contracts_processed": GLOBAL_STATE.get("contracts_processed"),
+                "exposures_ms": GLOBAL_STATE.get("exposures_ms"),
+                "loop_ms": GLOBAL_STATE.get("loop_ms"),
+                "last_alert_id": GLOBAL_STATE.get("last_alert_id"),
+            }
+        )
+
+    @app.get("/archive/alerts")
+    async def archive_alerts(limit: int = Query(default=10, ge=1, le=100)) -> JSONResponse:
+        return JSONResponse({"alerts": fetch_alerts(cfg.db_path, limit=int(limit))})
+
+    @app.get("/candles")
+    async def candles(minutes: int = Query(default=240, ge=5, le=1440)) -> JSONResponse:
+        """
+        Optional 1m candles for the terminal chart (Polygon aggs).
+        Returns Lightweight Charts candlestick format: {time, open, high, low, close}.
+        """
+        async with httpx.AsyncClient() as client:
+            end = _utc_now()
+            start = end - timedelta(minutes=int(minutes))
+            aggs, err = await fetch_aggs_1m(client, cfg, cfg.spot_symbol, start, end)
+            if aggs is None:
+                return JSONResponse({"candles": [], "reason": err or "aggs unavailable"})
+            candles_out = []
+            for x in aggs:
+                try:
+                    t_ms = int(x["t"])
+                    candles_out.append(
+                        {
+                            "time": int(t_ms // 1000),
+                            "open": float(x["o"]),
+                            "high": float(x["h"]),
+                            "low": float(x["l"]),
+                            "close": float(x["c"]),
+                        }
+                    )
+                except Exception:
+                    continue
+            return JSONResponse({"candles": candles_out, "reason": None})
+
+    @app.get("/stats")
+    async def stats() -> JSONResponse:
+        return JSONResponse(compute_stats(cfg.db_path))
+
+    @app.websocket("/ws")
+    async def ws_endpoint(ws: WebSocket) -> None:
+        await ws.accept()
+        try:
+            while True:
+                # Stream GLOBAL_STATE (include required new fields)
+                payload = {
+                    # exposures
+                    "net_gex": GLOBAL_STATE.get("net_gex"),
+                    "net_vex": GLOBAL_STATE.get("net_vex"),
+                    "net_cex": GLOBAL_STATE.get("net_cex"),
+                    "net_delta": GLOBAL_STATE.get("net_delta"),
+                    "d_gex": GLOBAL_STATE.get("d_gex"),
+                    "d_delta": GLOBAL_STATE.get("d_delta"),
+                    # vol regime
+                    "vol_short": GLOBAL_STATE.get("vol_short"),
+                    "vol_long": GLOBAL_STATE.get("vol_long"),
+                    "vol_rising": GLOBAL_STATE.get("vol_rising"),
+                    # engine
+                    "regime": GLOBAL_STATE.get("regime"),
+                    "trigger_text": GLOBAL_STATE.get("trigger_text"),
+                    "engine_status": GLOBAL_STATE.get("engine_status"),
+                    "engine_reason": GLOBAL_STATE.get("engine_reason"),
+                    "market_session": GLOBAL_STATE.get("market_session"),
+                    "last_tick_ny": GLOBAL_STATE.get("last_tick_ny"),
+                    "latency_ms": GLOBAL_STATE.get("latency_ms"),
+                    "data_integrity": GLOBAL_STATE.get("data_integrity"),
+                    "spot": GLOBAL_STATE.get("spot"),
+                    "spot_valid": GLOBAL_STATE.get("spot_valid"),
+                    "spot_age_s": GLOBAL_STATE.get("spot_age_s"),
+                    "last_close": GLOBAL_STATE.get("last_close"),
+                    "options_age_s": GLOBAL_STATE.get("options_age_s"),
+                    "ws_ok": True,
+                    "contracts_processed": GLOBAL_STATE.get("contracts_processed"),
+                    "exposures_ms": GLOBAL_STATE.get("exposures_ms"),
+                    "loop_ms": GLOBAL_STATE.get("loop_ms"),
+                    "last_alert_id": GLOBAL_STATE.get("last_alert_id"),
+                    "why": GLOBAL_STATE.get("why") or [],
+                    "scenario": GLOBAL_STATE.get("scenario"),
+                    "mood": GLOBAL_STATE.get("mood"),
+                    "trade_bias": GLOBAL_STATE.get("trade_bias"),
+                    "trade_confidence": GLOBAL_STATE.get("trade_confidence"),
+                    "trade_logic": GLOBAL_STATE.get("trade_logic") or [],
+                    "proxy_label": GLOBAL_STATE.get("proxy_label"),
+                    "coverage": GLOBAL_STATE.get("coverage"),
+                    "confidence": GLOBAL_STATE.get("confidence"),
+                    "gamma_flip": GLOBAL_STATE.get("gamma_flip"),
+                    "gamma_walls": GLOBAL_STATE.get("gamma_walls"),
+                    "net_vanna": GLOBAL_STATE.get("net_vanna"),
+                    "net_charm": GLOBAL_STATE.get("net_charm"),
+                    # charts
+                    "spot_series": GLOBAL_STATE.get("spot_series") or [],
+                    "vol_series": GLOBAL_STATE.get("vol_series") or [],
+                }
+                await ws.send_text(json.dumps(payload))
+                await asyncio.sleep(0.2)  # 5 Hz; UI will throttle to 10fps max
+        except WebSocketDisconnect:
+            return
+        except Exception:
+            logger.exception("ws error")
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    return app
+
+
+def _load_cfg() -> TitanConfig:
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        raise RuntimeError("POLYGON_API_KEY env var is required (no hardcoding).")
+    db_path = os.getenv("TITAN_DB_PATH", os.path.join(os.path.dirname(__file__), "TitanArchive.sqlite"))
+    static_dir = os.getenv("TITAN_STATIC_DIR", os.path.join(os.path.dirname(__file__), "static"))
+    return TitanConfig(polygon_api_key=api_key, db_path=db_path, static_dir=static_dir)
+
+
+app = build_app(_load_cfg())
+

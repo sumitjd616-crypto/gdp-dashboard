@@ -1,0 +1,693 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TITAN OMEGA v17.5 | Quant Terminal</title>
+    <script src="https://unpkg.com/lightweight-charts@4.2.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+      :root{
+        --bg:#020617;
+        --panel:#0b1220;
+        --panel2:#0a1020;
+        --muted:#94a3b8;
+        --text:#e2e8f0;
+        --border:rgba(148,163,184,0.18);
+        --red:#ef4444;
+        --green:#22c55e;
+        --amber:#f59e0b;
+        --yellow:#facc15;
+        --blue:#60a5fa;
+      }
+      *{box-sizing:border-box}
+      body{
+        margin:0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+        background:var(--bg);
+        color:var(--text);
+      }
+      .topbar{
+        display:flex;
+        align-items:center;
+        gap:12px;
+        padding:10px 14px;
+        border-bottom:1px solid var(--border);
+        background:linear-gradient(180deg, rgba(30,41,59,0.35), rgba(2,6,23,0));
+        position:sticky; top:0; z-index:10;
+      }
+      .brand{font-weight:800; letter-spacing:0.2px;}
+      .pill{
+        display:inline-flex; align-items:center; gap:8px;
+        padding:6px 10px; border:1px solid var(--border);
+        border-radius:999px; background:rgba(2,6,23,0.35);
+        color:var(--muted); font-size:12px;
+      }
+      .dot{width:10px; height:10px; border-radius:999px; background:var(--red); box-shadow:0 0 0 3px rgba(239,68,68,0.12);}
+      .dot.green{background:var(--green); box-shadow:0 0 0 3px rgba(34,197,94,0.12);}
+      .dot.amber{background:var(--amber); box-shadow:0 0 0 3px rgba(245,158,11,0.12);}
+      .dot.red{background:var(--red); box-shadow:0 0 0 3px rgba(239,68,68,0.12);}
+      .spacer{flex:1}
+      .grid{
+        display:grid;
+        grid-template-columns: 7fr 3fr;
+        gap:12px;
+        padding:12px;
+      }
+      .card{
+        background:rgba(11,18,32,0.92);
+        border:1px solid var(--border);
+        border-radius:14px;
+        overflow:hidden;
+      }
+      .cardHeader{
+        padding:10px 12px;
+        border-bottom:1px solid var(--border);
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:10px;
+      }
+      .cardTitle{font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:0.12em;}
+      .cardBody{padding:12px;}
+      .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
+      .kv{display:flex; flex-direction:column; gap:4px; min-width: 140px;}
+      .k{font-size:12px; color:var(--muted);}
+      .v{font-size:16px; font-weight:700;}
+      .v.small{font-size:13px; font-weight:600; color:var(--text);}
+      .badge{
+        font-size:11px; font-weight:800;
+        padding:3px 8px; border-radius:999px;
+        border:1px solid var(--border);
+      }
+      .badge.pre{background:rgba(250,204,21,0.12); color:var(--yellow); border-color:rgba(250,204,21,0.28);}
+      .badge.flush{background:rgba(239,68,68,0.12); color:var(--red); border-color:rgba(239,68,68,0.28);}
+      .badge.charm{background:rgba(34,197,94,0.12); color:var(--green); border-color:rgba(34,197,94,0.28);}
+      .badge.neutral{background:rgba(96,165,250,0.10); color:var(--blue); border-color:rgba(96,165,250,0.22);}
+      .why{
+        margin:10px 0 0 0;
+        padding-left:18px;
+        color:var(--muted);
+        font-size:12px;
+      }
+      .split{
+        display:grid;
+        grid-template-rows: 1fr auto;
+        gap:12px;
+      }
+      #chart{height:520px;}
+      #volSpark{height:90px;}
+      .list{max-height:240px; overflow:auto;}
+      .item{
+        padding:10px 10px;
+        border-bottom:1px solid rgba(148,163,184,0.10);
+        cursor:pointer;
+      }
+      .item:hover{background:rgba(148,163,184,0.06);}
+      .itemSel{outline:2px solid rgba(96,165,250,0.35); background:rgba(96,165,250,0.06);}
+      .itemTop{display:flex; align-items:center; justify-content:space-between; gap:10px;}
+      .itemMsg{font-size:12px; color:var(--text); margin-top:6px;}
+      .muted{color:var(--muted); font-size:12px;}
+      .drawer{
+        position:fixed; right:12px; bottom:12px;
+        width:420px; max-width:calc(100vw - 24px);
+        background:rgba(2,6,23,0.96);
+        border:1px solid var(--border);
+        border-radius:14px;
+        box-shadow:0 12px 40px rgba(0,0,0,0.45);
+        display:none;
+        overflow:hidden;
+        z-index:20;
+      }
+      .drawerHeader{padding:10px 12px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;}
+      .drawerClose{cursor:pointer; color:var(--muted); font-weight:800;}
+      .drawerBody{padding:12px;}
+      .banner{
+        margin:12px;
+        padding:10px 12px;
+        border-radius:12px;
+        border:1px solid rgba(245,158,11,0.30);
+        background:rgba(245,158,11,0.08);
+        color:var(--text);
+        display:none;
+      }
+      .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
+      a { color: var(--blue); text-decoration: none; }
+    </style>
+  </head>
+  <body>
+    <div class="topbar">
+      <div class="brand">TITAN OMEGA v17.5</div>
+      <div class="pill"><span class="mono">SPX</span> (via <span class="mono">SPY</span> proxy)</div>
+      <div class="pill"><span id="connState">OFFLINE</span></div>
+      <div class="pill">Session: <span id="marketSession" class="mono">UNKNOWN</span></div>
+      <div class="pill">Last Tick (NY): <span id="lastTickNy" class="mono">N/A</span></div>
+      <div class="pill">Latency: <span id="latency" class="mono">N/A</span></div>
+      <div class="spacer"></div>
+      <div class="pill">
+        <div id="integrityDot" class="dot red" title="Data Integrity"></div>
+        <span>Data Integrity</span>
+      </div>
+    </div>
+
+    <div id="closedBanner" class="banner">
+      <div style="font-weight:900;">MARKET CLOSED</div>
+      <div class="muted" id="closedReason">Showing last 5 archived alerts from SQLite TitanArchive.</div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="cardHeader">
+          <div class="cardTitle">SPY Candles + Alerts</div>
+          <div class="muted">Chart updates are throttled (≤10fps)</div>
+        </div>
+        <div class="cardBody">
+          <div id="chart"></div>
+          <div style="height:10px;"></div>
+          <div class="cardTitle" style="margin-bottom:8px;">Vol Regime (short vs long)</div>
+          <div id="volSpark"></div>
+        </div>
+      </div>
+
+      <div class="split">
+        <div class="card" id="regimeCard">
+          <div class="cardHeader">
+            <div class="cardTitle">Regime</div>
+            <span id="regimeBadge" class="badge neutral">NEUTRAL</span>
+          </div>
+          <div class="cardBody">
+            <div class="v" id="triggerText">NEUTRAL: Wait for structure.</div>
+            <div class="muted" style="margin-top:6px;" id="scenarioText">Most likely scenario: N/A</div>
+            <div class="muted" style="margin-top:6px;" id="proxyLine">Dealer-exposure proxy (OI+greeks) • Coverage: N/A • Confidence: N/A</div>
+            <div class="muted" style="margin-top:6px;">
+              <span style="text-transform:uppercase; letter-spacing:0.10em;">Gamma Walls (proxy)</span>:
+              <span class="mono" id="gammaWallsTop3">N/A</span>
+            </div>
+            <div class="muted" style="margin-top:6px;">
+              <span style="text-transform:uppercase; letter-spacing:0.10em;">Mood</span>:
+              <span class="mono" id="mood">N/A</span>
+              &nbsp;|&nbsp;
+              <span style="text-transform:uppercase; letter-spacing:0.10em;">Bias</span>:
+              <span class="mono" id="tradeBias">N/A</span>
+              &nbsp;|&nbsp;
+              <span style="text-transform:uppercase; letter-spacing:0.10em;">Trade Conf</span>:
+              <span class="mono" id="tradeConf">N/A</span>
+            </div>
+            <ul class="why" id="whyList"></ul>
+            <div style="height:10px;"></div>
+            <div class="row">
+              <div class="kv"><div class="k">Spot</div><div class="v mono" id="spot">N/A</div></div>
+              <div class="kv"><div class="k">Net GEX</div><div class="v mono" id="netGex">N/A</div></div>
+              <div class="kv"><div class="k">Net VEX</div><div class="v mono" id="netVex">N/A</div></div>
+              <div class="kv"><div class="k">Net CEX</div><div class="v mono" id="netCex">N/A</div></div>
+              <div class="kv"><div class="k">Net Delta</div><div class="v mono" id="netDelta">N/A</div></div>
+              <div class="kv"><div class="k">dGEX</div><div class="v mono" id="dGex">N/A</div></div>
+              <div class="kv"><div class="k">dDelta</div><div class="v mono" id="dDelta">N/A</div></div>
+              <div class="kv"><div class="k">Gamma Flip (proxy)</div><div class="v mono" id="gammaFlip">N/A</div></div>
+              <div class="kv"><div class="k">Net Vanna (proxy)</div><div class="v mono" id="netVanna">N/A</div></div>
+              <div class="kv"><div class="k">Net Charm (proxy)</div><div class="v mono" id="netCharm">N/A</div></div>
+              <div class="kv"><div class="k">Vol Rising</div><div class="v mono" id="volRising">N/A</div></div>
+              <div class="kv"><div class="k">Short / Long vol</div><div class="v mono" id="volVals">N/A</div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="cardHeader">
+            <div class="cardTitle">Alerts / Archive (last 10)</div>
+            <div class="muted">Click to open details</div>
+          </div>
+          <div class="cardBody">
+            <div class="list" id="alertsList"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="cardHeader">
+            <div class="cardTitle">Stats (hit-rate)</div>
+            <div class="muted" id="statsAsOf">asof N/A</div>
+          </div>
+          <div class="cardBody">
+            <div class="row" id="statsGrid"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="cardHeader">
+            <div class="cardTitle">Diagnostics</div>
+            <div class="muted">Health + timing</div>
+          </div>
+          <div class="cardBody">
+            <div class="row">
+              <div class="kv"><div class="k">ws_ok</div><div class="v mono small" id="wsOk">N/A</div></div>
+              <div class="kv"><div class="k">spot_age</div><div class="v mono small" id="spotAge">N/A</div></div>
+              <div class="kv"><div class="k">options_age</div><div class="v mono small" id="optAge">N/A</div></div>
+              <div class="kv"><div class="k">contracts</div><div class="v mono small" id="contracts">N/A</div></div>
+              <div class="kv"><div class="k">exposures_ms</div><div class="v mono small" id="expMs">N/A</div></div>
+              <div class="kv"><div class="k">loop_ms</div><div class="v mono small" id="loopMs">N/A</div></div>
+              <div class="kv"><div class="k">engine</div><div class="v mono small" id="engineStatus">N/A</div></div>
+            </div>
+            <div style="height:8px;"></div>
+            <div class="muted" id="engineReason"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="drawer" id="drawer">
+      <div class="drawerHeader">
+        <div class="cardTitle">Alert Detail</div>
+        <div class="drawerClose" id="drawerClose">Close</div>
+      </div>
+      <div class="drawerBody">
+        <div class="row" style="justify-content:space-between;">
+          <div id="drawerBadge" class="badge neutral">NEUTRAL</div>
+          <div class="muted mono" id="drawerTs">N/A</div>
+        </div>
+        <div style="height:10px;"></div>
+        <div class="v" id="drawerMsg">N/A</div>
+        <div class="muted" id="drawerTrigger" style="margin-top:6px;">N/A</div>
+        <div class="muted" style="margin-top:8px;">
+          <span style="text-transform:uppercase; letter-spacing:0.10em;">Gamma Walls (proxy)</span>:
+          <span class="mono" id="drawerGammaWalls">N/A</span>
+        </div>
+        <div class="muted" style="margin-top:8px;">
+          <span style="text-transform:uppercase; letter-spacing:0.10em;">Mood</span>:
+          <span class="mono" id="drawerMood">N/A</span>
+          &nbsp;|&nbsp;
+          <span style="text-transform:uppercase; letter-spacing:0.10em;">Bias</span>:
+          <span class="mono" id="drawerBias">N/A</span>
+          &nbsp;|&nbsp;
+          <span style="text-transform:uppercase; letter-spacing:0.10em;">Trade Conf</span>:
+          <span class="mono" id="drawerTradeConf">N/A</span>
+        </div>
+        <div class="muted" style="margin-top:8px; text-transform:uppercase; letter-spacing:0.10em;">Trade logic</div>
+        <ul class="why" id="drawerLogic"></ul>
+        <ul class="why" id="drawerWhy"></ul>
+      </div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      const state = {
+        ws: null,
+        lastWsMsgTs: 0,
+        lastChartUpdateTs: 0,
+        lastArchiveRefreshTs: 0,
+        closedMode: false,
+        alerts: [],
+        selectedAlertId: null,
+        markers: [],
+      };
+
+      function fmtNum(x) {
+        if (x === null || x === undefined || Number.isNaN(x)) return "N/A";
+        const ax = Math.abs(x);
+        if (ax >= 1e9) return (x/1e9).toFixed(2) + "B";
+        if (ax >= 1e6) return (x/1e6).toFixed(2) + "M";
+        if (ax >= 1e3) return x.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+        return (ax >= 100 ? x.toFixed(1) : x.toFixed(3));
+      }
+
+      function fmtInt(x) {
+        if (x === null || x === undefined || Number.isNaN(x)) return "N/A";
+        return String(Math.trunc(x));
+      }
+
+      function fmtBool(x) {
+        if (x === null || x === undefined) return "N/A";
+        return x ? "true" : "false";
+      }
+
+      function nyTimeFromMs(ms) {
+        if (!ms) return "N/A";
+        try {
+          const d = new Date(ms);
+          return new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour12: false,
+            month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit"
+          }).format(d);
+        } catch {
+          return "N/A";
+        }
+      }
+
+      function regimeStyle(regime) {
+        if (regime === "FLUSH") return { bg:"#450a0a", badge:"flush" };
+        if (regime === "CHARM") return { bg:"#064e3b", badge:"charm" };
+        if (regime === "PRE") return { bg:"#1e3a8a", badge:"pre" };
+        return { bg:"#020617", badge:"neutral" };
+      }
+
+      // ----------------- Charts -----------------
+      const chart = LightweightCharts.createChart($("chart"), {
+        layout:{ background:{ color: "rgba(2,6,23,0)" }, textColor:"#e2e8f0" },
+        grid:{ vertLines:{ color:"rgba(148,163,184,0.08)" }, horzLines:{ color:"rgba(148,163,184,0.08)" } },
+        rightPriceScale:{ borderColor:"rgba(148,163,184,0.18)" },
+        timeScale:{ borderColor:"rgba(148,163,184,0.18)", timeVisible:true, secondsVisible:false },
+        crosshair:{ mode: LightweightCharts.CrosshairMode.Normal }
+      });
+      const candleSeries = chart.addCandlestickSeries({
+        upColor: "rgba(34,197,94,0.9)",
+        downColor: "rgba(239,68,68,0.9)",
+        borderUpColor: "rgba(34,197,94,0.9)",
+        borderDownColor: "rgba(239,68,68,0.9)",
+        wickUpColor: "rgba(34,197,94,0.9)",
+        wickDownColor: "rgba(239,68,68,0.9)"
+      });
+      const spotLine = chart.addLineSeries({ color: "rgba(96,165,250,0.9)", lineWidth: 2 });
+
+      const volChart = LightweightCharts.createChart($("volSpark"), {
+        layout:{ background:{ color: "rgba(2,6,23,0)" }, textColor:"#94a3b8" },
+        grid:{ vertLines:{ color:"rgba(148,163,184,0.06)" }, horzLines:{ color:"rgba(148,163,184,0.06)" } },
+        rightPriceScale:{ borderVisible:false },
+        timeScale:{ visible:false }
+      });
+      const volShortSeries = volChart.addLineSeries({ color:"rgba(250,204,21,0.95)", lineWidth: 2 });
+      const volLongSeries = volChart.addLineSeries({ color:"rgba(148,163,184,0.85)", lineWidth: 2 });
+
+      async function loadCandles() {
+        try {
+          const r = await fetch("/candles?minutes=240");
+          if (!r.ok) return;
+          const j = await r.json();
+          if (!j || !Array.isArray(j.candles)) return;
+          candleSeries.setData(j.candles);
+          chart.timeScale().fitContent();
+        } catch {}
+      }
+
+      function alertColor(regime) {
+        if (regime === "PRE") return "#facc15";
+        if (regime === "FLUSH") return "#ef4444";
+        if (regime === "CHARM") return "#22c55e";
+        return "#60a5fa";
+      }
+
+      function shapeFor(regime) {
+        if (regime === "PRE") return "circle";
+        if (regime === "FLUSH") return "arrowDown";
+        if (regime === "CHARM") return "arrowUp";
+        return "circle";
+      }
+
+      function rebuildMarkers() {
+        const markers = [];
+        for (const a of state.alerts) {
+          const t = Date.parse(a.ts);
+          if (!Number.isFinite(t)) continue;
+          markers.push({
+            time: Math.floor(t/1000),
+            position: "aboveBar",
+            color: alertColor(a.regime),
+            shape: shapeFor(a.regime),
+            text: a.regime
+          });
+        }
+        candleSeries.setMarkers(markers);
+      }
+
+      // ----------------- Archive + Stats -----------------
+      function badgeClass(regime) {
+        if (regime === "PRE") return "pre";
+        if (regime === "FLUSH") return "flush";
+        if (regime === "CHARM") return "charm";
+        return "neutral";
+      }
+
+      function fmtGammaWallsTop3(walls) {
+        if (!Array.isArray(walls) || walls.length === 0) return "N/A";
+        const top3 = walls.slice(0,3);
+        const parts = [];
+        for (const w of top3) {
+          if (!w || w.strike === null || w.strike === undefined || Number.isNaN(w.strike)) continue;
+          const g = (w.gex === null || w.gex === undefined || Number.isNaN(w.gex)) ? null : w.gex;
+          // Show strike plus sign of proxy gex (not magnitude) for speed.
+          const sgn = (g === null) ? "" : (g > 0 ? "+" : (g < 0 ? "-" : "0"));
+          parts.push(`${fmtNum(w.strike)}${sgn}`);
+        }
+        return parts.length ? parts.join("  |  ") : "N/A";
+      }
+
+      function renderAlerts() {
+        const root = $("alertsList");
+        root.innerHTML = "";
+        for (const a of state.alerts.slice(0,10)) {
+          const div = document.createElement("div");
+          div.className = "item" + (state.selectedAlertId === a.id ? " itemSel" : "");
+          div.onclick = () => selectAlert(a.id);
+          div.innerHTML = `
+            <div class="itemTop">
+              <span class="badge ${badgeClass(a.regime)}">${a.regime}</span>
+              <span class="muted mono">#${a.id} ${nyTimeFromMs(Date.parse(a.ts))}</span>
+            </div>
+            <div class="itemMsg">${a.message}</div>
+          `;
+          root.appendChild(div);
+        }
+      }
+
+      function selectAlert(id) {
+        const a = state.alerts.find(x => x.id === id);
+        if (!a) return;
+        state.selectedAlertId = id;
+        renderAlerts();
+        $("drawer").style.display = "block";
+        $("drawerBadge").className = `badge ${badgeClass(a.regime)}`;
+        $("drawerBadge").innerText = a.regime;
+        $("drawerTs").innerText = nyTimeFromMs(Date.parse(a.ts));
+        $("drawerMsg").innerText = a.message || "N/A";
+        $("drawerTrigger").innerText = a.trigger_text || "N/A";
+        if (a.scenario) {
+          $("drawerTrigger").innerText = `${$("drawerTrigger").innerText} — ${a.scenario}`;
+        }
+        // Gamma walls from archive payload (levels_json stored in SQLite)
+        const walls = a.levels?.gamma_walls || null;
+        $("drawerGammaWalls").innerText = fmtGammaWallsTop3(walls);
+        $("drawerMood").innerText = a.mood || "N/A";
+        $("drawerBias").innerText = a.trade_bias || "N/A";
+        $("drawerTradeConf").innerText = (a.trade_confidence !== null && a.trade_confidence !== undefined) ? `${a.trade_confidence}` : "N/A";
+
+        const logicUl = $("drawerLogic");
+        logicUl.innerHTML = "";
+        for (const w of (a.trade_logic || [])) {
+          const li = document.createElement("li");
+          li.innerText = w;
+          logicUl.appendChild(li);
+        }
+        const ul = $("drawerWhy");
+        ul.innerHTML = "";
+        for (const w of (a.why || [])) {
+          const li = document.createElement("li");
+          li.innerText = w;
+          ul.appendChild(li);
+        }
+
+        // Highlight on chart by centering the visible range around the alert timestamp.
+        const t = Date.parse(a.ts);
+        if (Number.isFinite(t)) {
+          const sec = Math.floor(t / 1000);
+          try {
+            chart.timeScale().setVisibleRange({ from: sec - 60 * 45, to: sec + 60 * 15 });
+          } catch {}
+        }
+      }
+
+      $("drawerClose").onclick = () => { $("drawer").style.display = "none"; state.selectedAlertId = null; renderAlerts(); };
+
+      async function refreshArchive(limit=10) {
+        try {
+          const r = await fetch(`/archive/alerts?limit=${limit}`);
+          if (!r.ok) return;
+          const j = await r.json();
+          if (!j || !Array.isArray(j.alerts)) return;
+          state.alerts = j.alerts;
+          state.lastArchiveRefreshTs = Date.now();
+          renderAlerts();
+          rebuildMarkers();
+        } catch {}
+      }
+
+      function renderStats(stats) {
+        if (!stats) return;
+        $("statsAsOf").innerText = `asof ${stats.asof ? nyTimeFromMs(Date.parse(stats.asof)) : "N/A"}`;
+        const grid = $("statsGrid");
+        grid.innerHTML = "";
+        const regimes = ["PRE","FLUSH","CHARM"];
+        for (const r of regimes) {
+          const s30 = stats.by_regime?.[r]?.["30m"];
+          const s60 = stats.by_regime?.[r]?.["60m"];
+          const div = document.createElement("div");
+          div.className = "kv";
+          const hr30 = (s30 && s30.hit_rate !== null && s30.hit_rate !== undefined) ? (100*s30.hit_rate).toFixed(1)+"%" : "N/A";
+          const hr60 = (s60 && s60.hit_rate !== null && s60.hit_rate !== undefined) ? (100*s60.hit_rate).toFixed(1)+"%" : "N/A";
+          div.innerHTML = `
+            <div class="k">${r} hit-rate</div>
+            <div class="v mono small">30m: ${hr30} (n=${s30?.n ?? 0})</div>
+            <div class="v mono small">60m: ${hr60} (n=${s60?.n ?? 0})</div>
+          `;
+          grid.appendChild(div);
+        }
+      }
+
+      async function refreshStats() {
+        try {
+          const r = await fetch("/stats");
+          if (!r.ok) return;
+          const j = await r.json();
+          renderStats(j);
+        } catch {}
+      }
+
+      // ----------------- WS streaming -----------------
+      function setIntegrityDot(level) {
+        const el = $("integrityDot");
+        el.classList.remove("green","amber","red");
+        if (level === "green") el.classList.add("green");
+        else if (level === "amber") el.classList.add("amber");
+        else el.classList.add("red");
+      }
+
+      function setRegimeUI(regime, triggerText, why) {
+        const stl = regimeStyle(regime);
+        $("regimeCard").style.background = stl.bg;
+        $("regimeBadge").className = `badge ${stl.badge}`;
+        $("regimeBadge").innerText = regime || "NEUTRAL";
+        $("triggerText").innerText = triggerText || "NEUTRAL: Wait for structure.";
+        const ul = $("whyList");
+        ul.innerHTML = "";
+        for (const w of (why || [])) {
+          const li = document.createElement("li");
+          li.innerText = w;
+          ul.appendChild(li);
+        }
+      }
+
+      function applyWsPayload(p) {
+        const now = Date.now();
+        state.lastWsMsgTs = now;
+
+        const engine = p.engine_status || "N/A";
+        $("engineStatus").innerText = engine;
+        $("engineReason").innerText = p.engine_reason ? `Reason: ${p.engine_reason}` : "";
+
+        $("marketSession").innerText = p.market_session || "UNKNOWN";
+        $("lastTickNy").innerText = nyTimeFromMs(p.last_tick_ny);
+        $("latency").innerText = p.latency_ms !== null && p.latency_ms !== undefined ? `${fmtInt(p.latency_ms)}ms` : "N/A";
+        setIntegrityDot(p.data_integrity);
+
+        // Spot with fallback: last close only if spot is invalid.
+        if (p.spot_valid && p.spot !== null && p.spot !== undefined) {
+          $("spot").innerText = fmtNum(p.spot);
+        } else if (p.last_close !== null && p.last_close !== undefined) {
+          $("spot").innerText = `${fmtNum(p.last_close)} (Last Close)`;
+        } else {
+          $("spot").innerText = "N/A";
+        }
+
+        $("netGex").innerText = fmtNum(p.net_gex);
+        $("netVex").innerText = fmtNum(p.net_vex);
+        $("netCex").innerText = (p.net_cex === null || p.net_cex === undefined) ? "N/A (Polygon charm not provided)" : fmtNum(p.net_cex);
+        $("netDelta").innerText = fmtNum(p.net_delta);
+        $("dGex").innerText = fmtNum(p.d_gex);
+        $("dDelta").innerText = fmtNum(p.d_delta);
+        $("gammaFlip").innerText = (p.gamma_flip !== null && p.gamma_flip !== undefined) ? fmtNum(p.gamma_flip) : "N/A";
+        $("netVanna").innerText = fmtNum(p.net_vanna);
+        $("netCharm").innerText = fmtNum(p.net_charm);
+        $("volRising").innerText = fmtBool(p.vol_rising);
+        $("volVals").innerText = (p.vol_short !== null && p.vol_short !== undefined && p.vol_long !== null && p.vol_long !== undefined)
+          ? `${fmtNum(p.vol_short)} / ${fmtNum(p.vol_long)}` : "N/A";
+
+        $("wsOk").innerText = fmtBool(p.ws_ok);
+        $("spotAge").innerText = p.spot_age_s !== null && p.spot_age_s !== undefined ? `${fmtNum(p.spot_age_s)}s` : "N/A";
+        $("optAge").innerText = p.options_age_s !== null && p.options_age_s !== undefined ? `${fmtNum(p.options_age_s)}s` : "N/A";
+        $("contracts").innerText = fmtInt(p.contracts_processed);
+        $("expMs").innerText = p.exposures_ms !== null && p.exposures_ms !== undefined ? `${fmtNum(p.exposures_ms)}ms` : "N/A";
+        $("loopMs").innerText = p.loop_ms !== null && p.loop_ms !== undefined ? `${fmtNum(p.loop_ms)}ms` : "N/A";
+
+        setRegimeUI(p.regime || "NEUTRAL", p.trigger_text, p.why || []);
+        $("scenarioText").innerText = p.scenario ? `Most likely scenario: ${p.scenario}` : "Most likely scenario: N/A";
+        $("gammaWallsTop3").innerText = fmtGammaWallsTop3(p.gamma_walls);
+        $("mood").innerText = p.mood || "N/A";
+        $("tradeBias").innerText = p.trade_bias || "N/A";
+        $("tradeConf").innerText = (p.trade_confidence !== null && p.trade_confidence !== undefined) ? `${p.trade_confidence}` : "N/A";
+        // Proxy labeling + coverage/confidence (never imply true dealer book)
+        const cov = p.coverage || null;
+        const covGreeks = (cov && cov.coverage_greeks !== null && cov.coverage_greeks !== undefined) ? (100*cov.coverage_greeks).toFixed(0) + "%" : "N/A";
+        const covModel = (cov && cov.coverage_model !== null && cov.coverage_model !== undefined) ? (100*cov.coverage_model).toFixed(0) + "%" : "N/A";
+        const conf = p.confidence || "N/A";
+        const label = p.proxy_label || "Dealer-exposure proxy (OI+greeks)";
+        $("proxyLine").innerText = `${label} • Coverage: greeks ${covGreeks}, model ${covModel} • Confidence: ${conf}`;
+
+        // Market closed banner + archive fallback
+        const closed = (p.engine_status === "MARKET_CLOSED") || (p.market_session === "CLOSED");
+        $("closedBanner").style.display = closed ? "block" : "none";
+        if (closed) {
+          $("closedReason").innerText = "Showing last 5 archived alerts from SQLite TitanArchive.";
+          if (!state.closedMode || (Date.now() - state.lastArchiveRefreshTs) > 15000) {
+            state.closedMode = true;
+            refreshArchive(5);
+          }
+        } else {
+          state.closedMode = false;
+        }
+
+        // Chart updates (throttled ≤10fps)
+        if (now - state.lastChartUpdateTs >= 100) {
+          state.lastChartUpdateTs = now;
+          if (Array.isArray(p.spot_series) && p.spot_series.length) {
+            // Use last point only for incremental update
+            const last = p.spot_series[p.spot_series.length - 1];
+            if (last && last.ts_ms && last.price) {
+              spotLine.update({ time: Math.floor(last.ts_ms/1000), value: last.price });
+            }
+          }
+          if (Array.isArray(p.vol_series) && p.vol_series.length) {
+            const last = p.vol_series[p.vol_series.length - 1];
+            if (last && last.ts_ms) {
+              if (last.vol_short !== null && last.vol_short !== undefined) volShortSeries.update({ time: Math.floor(last.ts_ms/1000), value: last.vol_short });
+              if (last.vol_long !== null && last.vol_long !== undefined) volLongSeries.update({ time: Math.floor(last.ts_ms/1000), value: last.vol_long });
+            }
+          }
+        }
+      }
+
+      function connectWs() {
+        const proto = (location.protocol === "https:") ? "wss" : "ws";
+        const wsUrl = `${proto}://${location.host}/ws`;
+        $("connState").innerText = "OFFLINE";
+        try {
+          const ws = new WebSocket(wsUrl);
+          state.ws = ws;
+          ws.onopen = () => { $("connState").innerText = "LIVE"; };
+          ws.onclose = () => { $("connState").innerText = "OFFLINE"; setTimeout(connectWs, 1500); };
+          ws.onerror = () => { $("connState").innerText = "OFFLINE"; };
+          ws.onmessage = (ev) => {
+            try { applyWsPayload(JSON.parse(ev.data)); }
+            catch {}
+          };
+        } catch {
+          setTimeout(connectWs, 1500);
+        }
+      }
+
+      // Stale indicator without forcing rerender
+      setInterval(() => {
+        const age = Date.now() - state.lastWsMsgTs;
+        if (state.lastWsMsgTs === 0) return;
+        if (age > 4000) $("connState").innerText = "STALE";
+      }, 1000);
+
+      // Periodic REST refresh (archive + stats)
+      setInterval(() => { refreshArchive(10); refreshStats(); }, 30000);
+
+      // Initial boot
+      (async () => {
+        await loadCandles();
+        await refreshArchive(10);
+        await refreshStats();
+        connectWs();
+      })();
+    </script>
+  </body>
+</html>
+

@@ -1,19 +1,32 @@
-# :earth_americas: GDP dashboard template
+## TITAN OMEGA v17.5 — Quant Terminal V2
 
-A simple Streamlit app showing the GDP of different countries in the world.
+**Polygon-only live data.** Provide your API key via environment variable `POLYGON_API_KEY` (never hardcoded).
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://gdp-dashboard-template.streamlit.app/)
+### Run
 
-### How to run it on your own machine
+Install deps:
 
-1. Install the requirements
+```
+pip install -r requirements.txt
+```
 
-   ```
-   $ pip install -r requirements.txt
-   ```
+Option A (recommended): run the FastAPI terminal directly:
 
-2. Run the app
+```
+export POLYGON_API_KEY="..."
+python -m uvicorn titan_server:app --host 0.0.0.0 --port 8000
+```
 
-   ```
-   $ streamlit run streamlit_app.py
-   ```
+Then open:
+- Terminal UI: `http://localhost:8000/`
+- Health: `http://localhost:8000/health`
+- Alerts archive: `http://localhost:8000/archive/alerts?limit=10`
+- Stats: `http://localhost:8000/stats`
+- WS: `ws://localhost:8000/ws`
+
+Option B: run via Streamlit wrapper (embeds the terminal UI):
+
+```
+export POLYGON_API_KEY="..."
+streamlit run streamlit_app.py
+```
