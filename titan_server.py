@@ -57,6 +57,7 @@ GLOBAL_STATE: Dict[str, Any] = {
     "regime": "NEUTRAL",  # PRE | FLUSH | CHARM | NEUTRAL
     "trigger_text": "NEUTRAL: Wait for structure.",
     "why": [],
+    "scenario": None,
     "last_alert_id": None,
     # For UI charts
     "spot_series": [],  # list[{ts_ms, price}]
@@ -126,6 +127,7 @@ def migrate_sqlite(db_path: str) -> None:
               regime TEXT NOT NULL,
               message TEXT NOT NULL,
               trigger_text TEXT,
+              scenario TEXT,
               why_json TEXT,
               spot REAL,
               net_gex REAL,
@@ -140,6 +142,11 @@ def migrate_sqlite(db_path: str) -> None:
             );
             """
         )
+        # Safe column add for existing DBs (SQLite has no IF NOT EXISTS for columns).
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN scenario TEXT;")
+        except Exception:
+            pass
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS outcomes (
@@ -417,16 +424,17 @@ def insert_alert(db_path: str, payload: Dict[str, Any]) -> int:
         cur = conn.execute(
             """
             INSERT INTO alerts (
-              ts, regime, message, trigger_text, why_json,
+              ts, regime, message, trigger_text, scenario, why_json,
               spot, net_gex, net_vex, net_cex, net_delta,
               d_gex, d_delta, vol_short, vol_long, vol_rising
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 payload["ts"],
                 payload["regime"],
                 payload["message"],
                 payload.get("trigger_text"),
+                payload.get("scenario"),
                 json.dumps(payload.get("why") or []),
                 payload.get("spot"),
                 payload.get("net_gex"),
@@ -451,7 +459,7 @@ def fetch_alerts(db_path: str, limit: int) -> List[Dict[str, Any]]:
     try:
         rows = conn.execute(
             """
-            SELECT id, ts, regime, message, trigger_text, why_json, spot
+            SELECT id, ts, regime, message, trigger_text, scenario, why_json, spot
             FROM alerts
             ORDER BY id DESC
             LIMIT ?
@@ -467,6 +475,7 @@ def fetch_alerts(db_path: str, limit: int) -> List[Dict[str, Any]]:
                     "regime": r["regime"],
                     "message": r["message"],
                     "trigger_text": r["trigger_text"],
+                    "scenario": r["scenario"],
                     "why": json.loads(r["why_json"] or "[]"),
                     "spot": r["spot"],
                 }
@@ -554,15 +563,14 @@ async def evaluate_alert_outcomes(
 
     evaluated_ts = _iso(_utc_now())
 
-    # Mapping rule (conservative, documented):
-    # If we can fetch I:SPX from Polygon, we map 15 SPX points to SPY points via ratio SPY/SPX.
-    # Otherwise we use a fixed 10x SPX:SPY rule -> 15 SPX pts ~= 1.5 SPY pts.
+    # Mapping rule (Polygon-only, no synthetic fallback):
+    # We map 15 SPX points to SPY points via ratio SPY/SPX using Polygon last-trade for both.
     spy_price_now, _, _ = await fetch_last_trade(client, cfg, cfg.spot_symbol)
     spx_price, _, _ = await fetch_last_trade(client, cfg, "I:SPX")
-    if spy_price_now is not None and spx_price is not None and spx_price > 0:
-        spy_threshold = 15.0 * (float(spy_price_now) / float(spx_price))
-    else:
-        spy_threshold = 1.5
+    if spy_price_now is None or spx_price is None or not (float(spx_price) > 0):
+        # Cannot evaluate without real mapping inputs; do not insert synthetic outcomes.
+        return []
+    spy_threshold = 15.0 * (float(spy_price_now) / float(spx_price))
 
     rows_to_insert: List[Tuple[int, int, int, Optional[float], Optional[float], str]] = []
     for horizon in (30, 60):
@@ -595,12 +603,19 @@ class TitanEngine:
     def __init__(self, cfg: TitanConfig):
         self.cfg = cfg
         self._spot_hist: Deque[Tuple[float, float]] = deque(maxlen=6000)  # (ts_s, price)
-        self._deriv_hist: Deque[Tuple[float, float, float]] = deque(maxlen=6000)  # (ts_s, net_gex, net_delta)
+        self._exposure_hist: Deque[Tuple[float, float, float]] = deque(maxlen=6000)  # (ts_s, net_gex, net_delta)
+        self._deriv_hist: Deque[Tuple[float, float, float]] = deque(maxlen=6000)  # (ts_s, d_gex, d_delta)
         self._last_log_s = 0.0
         self._last_pre_s = 0.0
         self._last_flush_s = 0.0
         self._last_charm_s = 0.0
         self._last_emit_id: Optional[int] = None
+        self._last_aggs_fetch_s = 0.0
+        self._last_options_fetch_s = 0.0
+        self._cached_aggs: Optional[List[Dict[str, Any]]] = None
+        self._cached_aggs_err: Optional[str] = None
+        self._cached_options: Optional[List[Dict[str, Any]]] = None
+        self._cached_options_err: Optional[str] = None
 
     def _update_series(self, now: datetime, spot: float, vol_short: Optional[float], vol_long: Optional[float]) -> None:
         # Keep small series for UI streaming.
@@ -614,14 +629,15 @@ class TitanEngine:
     def _compute_derivatives(self, now_s: float, net_gex: Optional[float], net_delta: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
         if net_gex is None or net_delta is None:
             return None, None
-        if not self._deriv_hist:
-            self._deriv_hist.append((now_s, net_gex, net_delta))
+        if not self._exposure_hist:
+            self._exposure_hist.append((now_s, net_gex, net_delta))
             return None, None
-        prev_t, prev_gex, prev_delta = self._deriv_hist[-1]
+        prev_t, prev_gex, prev_delta = self._exposure_hist[-1]
         dt = max(1e-6, now_s - prev_t)
         d_gex = (net_gex - prev_gex) / dt
         d_delta = (net_delta - prev_delta) / dt
-        self._deriv_hist.append((now_s, net_gex, net_delta))
+        self._exposure_hist.append((now_s, net_gex, net_delta))
+        self._deriv_hist.append((now_s, float(d_gex), float(d_delta)))
         return float(d_gex), float(d_delta)
 
     def _spot_stall(self, now_s: float, spot: float) -> Tuple[Optional[bool], Optional[float]]:
@@ -643,22 +659,40 @@ class TitanEngine:
     def _d_delta_threshold(self, now_s: float) -> Optional[float]:
         window_s = float(self.cfg.deriv_window_minutes) * 60.0
         cutoff = now_s - window_s
-        # Extract d_delta values from deriv history using finite diffs of stored net_delta.
         if len(self._deriv_hist) < 5:
             return None
-        # Recompute d_delta series cheaply over recent window.
-        recent = [(t, d) for (t, _, d) in self._deriv_hist if t >= cutoff]
-        if len(recent) < 10:
+        recent = [abs(dd) for (t, _, dd) in self._deriv_hist if t >= cutoff and dd is not None]
+        if len(recent) < 20:
             return None
-        d_deltas = []
-        for i in range(1, len(recent)):
-            t0, d0 = recent[i - 1]
-            t1, d1 = recent[i]
-            dt = max(1e-6, t1 - t0)
-            d_deltas.append((d1 - d0) / dt)
-        if len(d_deltas) < 10:
-            return None
-        return float(np.percentile(np.abs(np.asarray(d_deltas, dtype=np.float64)), self.cfg.d_delta_percentile))
+        return float(np.percentile(np.asarray(recent, dtype=np.float64), self.cfg.d_delta_percentile))
+
+    def _scenario_text(
+        self,
+        regime: str,
+        net_gex: Optional[float],
+        d_delta: Optional[float],
+        vol_rising: Optional[bool],
+        spot_stall: Optional[bool],
+    ) -> Optional[str]:
+        # Polygon-only computed heuristics; always presented as "likely", never as certainty.
+        if regime == "PRE":
+            if d_delta is None:
+                return "Likely move risk building, but d_delta unavailable."
+            if d_delta > 0:
+                return "Likely UP risk: accelerating hedging demand while spot stalls."
+            return "Likely DOWN risk: accelerating hedge selling pressure while spot stalls."
+        if regime == "FLUSH":
+            return "Likely downside continuation: vol expansion + destabilizing hedging flow."
+        if regime == "CHARM":
+            return "Likely mean-reversion: stabilizing flow with supportive gamma profile."
+        # Neutral context
+        if vol_rising is True:
+            return "Neutral, but vol is rising: expect wider swings; wait for confirmation."
+        if net_gex is not None and net_gex > 0:
+            return "Neutral, slight mean-reversion bias (positive gamma profile)."
+        if net_gex is not None and net_gex < 0:
+            return "Neutral, higher trend risk (negative gamma profile)."
+        return None
 
     def _should_emit(self, regime: str) -> bool:
         now_s = time.time()
@@ -699,6 +733,8 @@ class TitanEngine:
 
                 market_session, market_reason = await fetch_market_session(client, cfg)
                 GLOBAL_STATE["market_session"] = market_session
+                if market_session == "UNKNOWN" and market_reason:
+                    loop_reason = market_reason
 
                 if market_session == "CLOSED":
                     GLOBAL_STATE["engine_status"] = "MARKET_CLOSED"
@@ -727,14 +763,17 @@ class TitanEngine:
                 now_s = time.time()
                 self._spot_hist.append((now_s, float(spot)))
 
-                # Vol regime from 1m aggs (last 60 minutes)
-                aggs, aggs_err = await fetch_aggs_1m(
-                    client,
-                    cfg,
-                    cfg.spot_symbol,
-                    now - timedelta(minutes=65),
-                    now,
-                )
+                # Vol regime from 1m aggs (last 60 minutes), cached to stay smooth.
+                if (now_s - self._last_aggs_fetch_s) >= 15.0 or self._cached_aggs is None:
+                    self._last_aggs_fetch_s = now_s
+                    self._cached_aggs, self._cached_aggs_err = await fetch_aggs_1m(
+                        client,
+                        cfg,
+                        cfg.spot_symbol,
+                        now - timedelta(minutes=65),
+                        now,
+                    )
+                aggs, aggs_err = self._cached_aggs, self._cached_aggs_err
                 vol_short = None
                 vol_long = None
                 vol_rising = None
@@ -762,26 +801,36 @@ class TitanEngine:
                 GLOBAL_STATE["vol_long"] = vol_long
                 GLOBAL_STATE["vol_rising"] = vol_rising
 
-                # Options snapshot -> exposures
-                snap_first, snap_err = await fetch_options_snapshot_page(client, cfg, cfg.options_underlying)
-                snapshot_results = []
-                next_url = None
+                # Options snapshot -> exposures (cached to reduce API load; still Polygon realtime).
+                snap_err = None
+                snapshot_results: List[Dict[str, Any]] = []
                 options_age_s = None
-                if snap_first and isinstance(snap_first, dict):
-                    snapshot_results.extend(snap_first.get("results") or [])
-                    next_url = snap_first.get("next_url")
-                else:
-                    snap_err = snap_err or "options snapshot missing"
+                if (now_s - self._last_options_fetch_s) >= 10.0 or self._cached_options is None:
+                    self._last_options_fetch_s = now_s
+                    snap_first, snap_err = await fetch_options_snapshot_page(client, cfg, cfg.options_underlying)
+                    snapshot_results = []
+                    next_url = None
+                    if snap_first and isinstance(snap_first, dict):
+                        snapshot_results.extend(snap_first.get("results") or [])
+                        next_url = snap_first.get("next_url")
+                    else:
+                        snap_err = snap_err or "options snapshot missing"
 
-                # Pull up to 3 pages max to avoid heavy loops.
-                pages = 1
-                while next_url and pages < 3:
-                    snap, err = await fetch_options_snapshot_page(client, cfg, cfg.options_underlying, next_url=next_url)
-                    if not snap or not isinstance(snap, dict):
-                        break
-                    snapshot_results.extend(snap.get("results") or [])
-                    next_url = snap.get("next_url")
-                    pages += 1
+                    # Pull up to 3 pages max to avoid heavy loops.
+                    pages = 1
+                    while next_url and pages < 3:
+                        snap, _err = await fetch_options_snapshot_page(client, cfg, cfg.options_underlying, next_url=next_url)
+                        if not snap or not isinstance(snap, dict):
+                            break
+                        snapshot_results.extend(snap.get("results") or [])
+                        next_url = snap.get("next_url")
+                        pages += 1
+
+                    self._cached_options = snapshot_results
+                    self._cached_options_err = snap_err
+                else:
+                    snapshot_results = self._cached_options or []
+                    snap_err = self._cached_options_err
 
                 exposures_t0 = time.perf_counter()
                 exposures, n_contracts, exp_reason, options_age_s = compute_exposures_from_snapshot(
@@ -835,6 +884,7 @@ class TitanEngine:
                 regime = "NEUTRAL"
                 trigger_text = "NEUTRAL: Wait for structure."
                 message = None
+                scenario = None
 
                 # PRE: d_delta acceleration above rolling percentile + spot stall
                 if (
@@ -850,6 +900,7 @@ class TitanEngine:
                         f"abs(d_delta)={abs(d_delta):.2f} > p{cfg.d_delta_percentile:.0f}={d_delta_thr:.2f}",
                         f"spot_stall=True (30s move={stall_frac:.5f})",
                     ]
+                    scenario = self._scenario_text(regime, exposures.get("net_gex"), d_delta, vol_rising, stall)
 
                 # FLUSH: only if vol_rising true
                 # Heuristic: negative net_gex + downside acceleration (d_delta negative) suggests forced dealer selling.
@@ -871,6 +922,7 @@ class TitanEngine:
                         "net_gex<0 (short gamma)",
                         "d_delta<0 (hedge selling accelerating)",
                     ]
+                    scenario = self._scenario_text(regime, exposures.get("net_gex"), d_delta, vol_rising, stall)
 
                 # CHARM: only if vol_rising false OR mean-reverting (optional)
                 # Heuristic: positive net_gex + non-rising vol + stabilizing d_delta -> time-decay support.
@@ -890,6 +942,7 @@ class TitanEngine:
                         "net_gex>0 (long gamma support)",
                         "abs(d_delta) below acceleration threshold",
                     ]
+                    scenario = self._scenario_text(regime, exposures.get("net_gex"), d_delta, vol_rising, stall)
 
                 # Emit alert (with cooldown, and only if computed inputs exist)
                 if message is not None and self._should_emit(regime):
@@ -899,6 +952,7 @@ class TitanEngine:
                         "regime": regime,
                         "message": message,
                         "trigger_text": trigger_text,
+                        "scenario": scenario,
                         "why": why,
                         "spot": float(spot),
                         "net_gex": exposures.get("net_gex"),
@@ -917,10 +971,12 @@ class TitanEngine:
                     GLOBAL_STATE["regime"] = regime
                     GLOBAL_STATE["trigger_text"] = trigger_text
                     GLOBAL_STATE["why"] = why
+                    GLOBAL_STATE["scenario"] = scenario
                 else:
                     GLOBAL_STATE["regime"] = regime
                     GLOBAL_STATE["trigger_text"] = trigger_text
                     GLOBAL_STATE["why"] = why
+                    GLOBAL_STATE["scenario"] = self._scenario_text(regime, exposures.get("net_gex"), d_delta, vol_rising, stall)
 
                 # Periodic log (max 1/min)
                 now_log = time.time()
@@ -1114,6 +1170,7 @@ def build_app(cfg: TitanConfig) -> FastAPI:
                     "loop_ms": GLOBAL_STATE.get("loop_ms"),
                     "last_alert_id": GLOBAL_STATE.get("last_alert_id"),
                     "why": GLOBAL_STATE.get("why") or [],
+                    "scenario": GLOBAL_STATE.get("scenario"),
                     # charts
                     "spot_series": GLOBAL_STATE.get("spot_series") or [],
                     "vol_series": GLOBAL_STATE.get("vol_series") or [],

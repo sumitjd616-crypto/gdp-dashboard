@@ -176,6 +176,7 @@
           </div>
           <div class="cardBody">
             <div class="v" id="triggerText">NEUTRAL: Wait for structure.</div>
+            <div class="muted" style="margin-top:6px;" id="scenarioText">Most likely scenario: N/A</div>
             <ul class="why" id="whyList"></ul>
             <div style="height:10px;"></div>
             <div class="row">
@@ -408,6 +409,9 @@
         $("drawerTs").innerText = nyTimeFromMs(Date.parse(a.ts));
         $("drawerMsg").innerText = a.message || "N/A";
         $("drawerTrigger").innerText = a.trigger_text || "N/A";
+        if (a.scenario) {
+          $("drawerTrigger").innerText = `${$("drawerTrigger").innerText} — ${a.scenario}`;
+        }
         const ul = $("drawerWhy");
         ul.innerHTML = "";
         for (const w of (a.why || [])) {
@@ -536,6 +540,7 @@
         $("loopMs").innerText = p.loop_ms !== null && p.loop_ms !== undefined ? `${fmtNum(p.loop_ms)}ms` : "N/A";
 
         setRegimeUI(p.regime || "NEUTRAL", p.trigger_text, p.why || []);
+        $("scenarioText").innerText = p.scenario ? `Most likely scenario: ${p.scenario}` : "Most likely scenario: N/A";
 
         // Market closed banner + archive fallback
         const closed = (p.engine_status === "MARKET_CLOSED") || (p.market_session === "CLOSED");
