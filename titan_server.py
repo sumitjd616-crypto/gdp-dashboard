@@ -42,6 +42,10 @@ GLOBAL_STATE: Dict[str, Any] = {
     "last_close": None,
     "options_age_s": None,
     "data_integrity": "red",  # green | amber | red
+    # Proxy labeling + coverage/confidence (never imply true dealer book)
+    "proxy_label": "Dealer-exposure proxy (OI+greeks)",
+    "coverage": None,  # dict or None
+    "confidence": None,  # HIGH | MED | LOW | None
     # Exposures
     "net_gex": None,
     "net_vex": None,
@@ -49,6 +53,11 @@ GLOBAL_STATE: Dict[str, Any] = {
     "net_delta": None,
     "d_gex": None,
     "d_delta": None,
+    # Levels / higher-order proxies (Polygon inputs, model outputs)
+    "gamma_flip": None,  # strike/level proxy
+    "gamma_walls": None,  # list[{strike, gex}]
+    "net_vanna": None,
+    "net_charm": None,
     # Vol regime
     "vol_short": None,
     "vol_long": None,
@@ -128,7 +137,10 @@ def migrate_sqlite(db_path: str) -> None:
               message TEXT NOT NULL,
               trigger_text TEXT,
               scenario TEXT,
+              confidence TEXT,
               why_json TEXT,
+              levels_json TEXT,
+              coverage_json TEXT,
               spot REAL,
               net_gex REAL,
               net_vex REAL,
@@ -136,6 +148,9 @@ def migrate_sqlite(db_path: str) -> None:
               net_delta REAL,
               d_gex REAL,
               d_delta REAL,
+              gamma_flip REAL,
+              net_vanna REAL,
+              net_charm REAL,
               vol_short REAL,
               vol_long REAL,
               vol_rising INTEGER
@@ -145,6 +160,30 @@ def migrate_sqlite(db_path: str) -> None:
         # Safe column add for existing DBs (SQLite has no IF NOT EXISTS for columns).
         try:
             conn.execute("ALTER TABLE alerts ADD COLUMN scenario TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN confidence TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN levels_json TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN coverage_json TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN gamma_flip REAL;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN net_vanna REAL;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN net_charm REAL;")
         except Exception:
             pass
         conn.execute(
@@ -331,7 +370,7 @@ def compute_atr_proxy(ohlc: np.ndarray) -> Optional[float]:
 def compute_exposures_from_snapshot(
     snapshot_results: List[Dict[str, Any]],
     spot: float,
-) -> Tuple[Dict[str, Optional[float]], int, Optional[str], Optional[float]]:
+) -> Tuple[Dict[str, Optional[float]], Dict[str, Any], int, Optional[str], Optional[float]]:
     """
     Returns:
       exposures dict: net_gex/net_vex/net_cex/net_delta (None if can't compute)
@@ -340,15 +379,26 @@ def compute_exposures_from_snapshot(
       options_age_s (None if can't compute)
     """
     if not snapshot_results:
-        return {"net_gex": None, "net_vex": None, "net_cex": None, "net_delta": None}, 0, "options snapshot empty", None
+        return (
+            {"net_gex": None, "net_vex": None, "net_cex": None, "net_delta": None},
+            {"gamma_flip": None, "gamma_walls": None, "net_vanna": None, "net_charm": None, "coverage": None, "confidence": None},
+            0,
+            "options snapshot empty",
+            None,
+        )
 
     # Only use contracts that have OI and greeks.
     oi = []
     delta = []
     gamma = []
     vega = []
+    iv = []
+    strike = []
+    cp_sign = []  # +1 for call, -1 for put (proxy sign convention)
+    texp_years = []
     last_updated_ms = []
 
+    now_utc = _utc_now()
     for row in snapshot_results:
         details = row.get("details") or {}
         greeks = row.get("greeks") or {}
@@ -360,6 +410,10 @@ def compute_exposures_from_snapshot(
             open_interest = day.get("open_interest")
         if open_interest is None:
             continue
+
+        contract_type = details.get("contract_type")
+        strike_price = details.get("strike_price")
+        exp = details.get("expiration_date")
 
         d = greeks.get("delta")
         g = greeks.get("gamma")
@@ -373,17 +427,53 @@ def compute_exposures_from_snapshot(
         gamma.append(np.nan if g is None else float(g))
         vega.append(np.nan if v is None else float(v))
 
+        # For levels / vanna / charm, we require strike + type + time to expiry (+ IV for vanna/charm).
+        strike.append(np.nan if strike_price is None else float(strike_price))
+        if contract_type == "call":
+            cp_sign.append(1.0)
+        elif contract_type == "put":
+            cp_sign.append(-1.0)
+        else:
+            cp_sign.append(np.nan)
+
+        iv_val = row.get("implied_volatility")
+        iv.append(np.nan if iv_val is None else float(iv_val))
+
+        t_years = np.nan
+        if isinstance(exp, str):
+            try:
+                # expiration_date is YYYY-MM-DD
+                exp_dt = datetime.fromisoformat(exp).replace(tzinfo=timezone.utc)
+                # Treat expiry as end-of-day UTC proxy (model assumption, labeled).
+                exp_dt = exp_dt + timedelta(hours=23, minutes=59, seconds=59)
+                dt_s = (exp_dt - now_utc).total_seconds()
+                if dt_s > 0:
+                    t_years = dt_s / (365.0 * 24.0 * 3600.0)
+            except Exception:
+                t_years = np.nan
+        texp_years.append(t_years)
+
         lm = row.get("last_updated")
         if isinstance(lm, int):
             last_updated_ms.append(lm)
 
     if not oi:
-        return {"net_gex": None, "net_vex": None, "net_cex": None, "net_delta": None}, 0, "no option contracts with OI+greeks", None
+        return (
+            {"net_gex": None, "net_vex": None, "net_cex": None, "net_delta": None},
+            {"gamma_flip": None, "gamma_walls": None, "net_vanna": None, "net_charm": None, "coverage": None, "confidence": None},
+            0,
+            "no option contracts with OI+greeks",
+            None,
+        )
 
     oi_a = np.asarray(oi, dtype=np.float64)
     d_a = np.asarray(delta, dtype=np.float64)
     g_a = np.asarray(gamma, dtype=np.float64)
     v_a = np.asarray(vega, dtype=np.float64)
+    iv_a = np.asarray(iv, dtype=np.float64)
+    k_a = np.asarray(strike, dtype=np.float64)
+    sign_a = np.asarray(cp_sign, dtype=np.float64)
+    t_a = np.asarray(texp_years, dtype=np.float64)
 
     # Contract multiplier is 100 shares for equity options.
     multiplier = 100.0
@@ -401,6 +491,101 @@ def compute_exposures_from_snapshot(
     # net_cex requires charm (dDelta/dt) which Polygon snapshots do not reliably provide.
     net_cex = None
 
+    # -----------------------------
+    # Levels (gamma walls + flip) + higher-order proxies (vanna/charm)
+    # IMPORTANT: These are *dealer-exposure proxies*, not true dealer inventory.
+    # Inputs: Polygon OI+greeks(+IV+expiry). Model assumptions are labeled in UI.
+    levels: Dict[str, Any] = {
+        "gamma_flip": None,
+        "gamma_walls": None,
+        "net_vanna": None,
+        "net_charm": None,
+        "coverage": None,
+        "confidence": None,
+    }
+
+    total = int(len(snapshot_results))
+    used_greeks = int(len(oi))
+    used_levels = int(np.sum(np.isfinite(k_a) & np.isfinite(sign_a)))
+    used_model = int(np.sum(np.isfinite(k_a) & np.isfinite(sign_a) & np.isfinite(iv_a) & np.isfinite(t_a) & (t_a > 0) & (iv_a > 0)))
+
+    coverage = {
+        "contracts_total": total,
+        "contracts_used_greeks": used_greeks,
+        "contracts_used_levels": used_levels,
+        "contracts_used_model": used_model,
+        "coverage_greeks": None if total == 0 else float(used_greeks) / float(total),
+        "coverage_levels": None if total == 0 else float(used_levels) / float(total),
+        "coverage_model": None if total == 0 else float(used_model) / float(total),
+        "assumptions": [
+            "Dealer-exposure proxy derived from Polygon OI+greeks (no true dealer book).",
+            "Gamma flip proxy uses call(+)/put(-) sign convention on OI-weighted gamma.",
+            "Charm/Vanna are Black-Scholes proxies using Polygon implied_volatility and time-to-expiry; r=0, q=0.",
+        ],
+    }
+
+    # Confidence heuristic: purely about data coverage + freshness (not forecast certainty).
+    conf = None
+    if coverage["coverage_greeks"] is not None:
+        if coverage["coverage_greeks"] >= 0.70 and (coverage["coverage_model"] or 0.0) >= 0.45:
+            conf = "HIGH"
+        elif coverage["coverage_greeks"] >= 0.45:
+            conf = "MED"
+        else:
+            conf = "LOW"
+
+    levels["coverage"] = coverage
+    levels["confidence"] = conf
+
+    # Gamma walls + flip proxy by strike (call+/put-).
+    strike_mask = np.isfinite(k_a) & np.isfinite(sign_a) & np.isfinite(g_a) & np.isfinite(oi_a)
+    if int(np.sum(strike_mask)) >= 50:
+        strikes = k_a[strike_mask]
+        signed_gex = (oi_a[strike_mask] * multiplier * g_a[strike_mask] * (spot ** 2)) * sign_a[strike_mask]
+        # Aggregate by strike (vectorized using unique)
+        u, inv = np.unique(strikes, return_inverse=True)
+        agg = np.zeros_like(u, dtype=np.float64)
+        np.add.at(agg, inv, signed_gex)
+        # Walls = top abs gamma strikes
+        idx = np.argsort(np.abs(agg))[::-1][:5]
+        walls = [{"strike": float(u[i]), "gex": float(agg[i])} for i in idx if np.isfinite(u[i])]
+        levels["gamma_walls"] = walls
+        # Flip proxy: first crossing of cumulative net gamma across strikes
+        order = np.argsort(u)
+        cum = np.cumsum(agg[order])
+        sgn = np.sign(cum)
+        flip = None
+        for i in range(1, len(sgn)):
+            if sgn[i - 1] == 0:
+                continue
+            if sgn[i] == 0 or sgn[i] == sgn[i - 1]:
+                continue
+            flip = float(u[order[i]])
+            break
+        levels["gamma_flip"] = flip
+
+    # Vanna + Charm proxies (BS, r=0, q=0), if we have IV + T.
+    model_mask = np.isfinite(k_a) & np.isfinite(sign_a) & np.isfinite(iv_a) & np.isfinite(t_a) & (t_a > 0) & (iv_a > 0) & np.isfinite(oi_a)
+    if int(np.sum(model_mask)) >= 100:
+        S = float(spot)
+        K = k_a[model_mask]
+        sig = iv_a[model_mask]
+        T = t_a[model_mask]
+        z = (np.log(np.maximum(S, 1e-12) / np.maximum(K, 1e-12)) + 0.5 * (sig ** 2) * T) / (sig * np.sqrt(T))
+        d1 = z
+        d2 = d1 - sig * np.sqrt(T)
+        phi = (1.0 / np.sqrt(2.0 * np.pi)) * np.exp(-0.5 * (d1 ** 2))
+
+        # Vanna proxy: phi(d1)*sqrt(T)*(1 - d1/(sigma*sqrt(T)))  (r=0,q=0)
+        vanna = phi * np.sqrt(T) * (1.0 - (d1 / (sig * np.sqrt(T))))
+        # Charm proxy (dDelta/dt) with r=0,q=0: phi(d1)*d2/(2T)
+        charm = phi * d2 / (2.0 * T)
+
+        oi_m = oi_a[model_mask]
+        sgn_m = sign_a[model_mask]  # call+/put- proxy
+        levels["net_vanna"] = float(np.nansum(oi_m * multiplier * vanna * sgn_m))
+        levels["net_charm"] = float(np.nansum(oi_m * multiplier * charm * sgn_m))
+
     age_s = None
     if last_updated_ms:
         newest_ms = max(last_updated_ms)
@@ -408,6 +593,7 @@ def compute_exposures_from_snapshot(
 
     return (
         {"net_gex": net_gex, "net_vex": net_vex, "net_cex": net_cex, "net_delta": net_delta},
+        levels,
         int(len(oi)),
         None,
         age_s,
@@ -424,10 +610,10 @@ def insert_alert(db_path: str, payload: Dict[str, Any]) -> int:
         cur = conn.execute(
             """
             INSERT INTO alerts (
-              ts, regime, message, trigger_text, scenario, why_json,
+              ts, regime, message, trigger_text, scenario, confidence, why_json, levels_json, coverage_json,
               spot, net_gex, net_vex, net_cex, net_delta,
-              d_gex, d_delta, vol_short, vol_long, vol_rising
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              d_gex, d_delta, gamma_flip, net_vanna, net_charm, vol_short, vol_long, vol_rising
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 payload["ts"],
@@ -435,7 +621,10 @@ def insert_alert(db_path: str, payload: Dict[str, Any]) -> int:
                 payload["message"],
                 payload.get("trigger_text"),
                 payload.get("scenario"),
+                payload.get("confidence"),
                 json.dumps(payload.get("why") or []),
+                json.dumps(payload.get("levels") or {}),
+                json.dumps(payload.get("coverage") or {}),
                 payload.get("spot"),
                 payload.get("net_gex"),
                 payload.get("net_vex"),
@@ -443,6 +632,9 @@ def insert_alert(db_path: str, payload: Dict[str, Any]) -> int:
                 payload.get("net_delta"),
                 payload.get("d_gex"),
                 payload.get("d_delta"),
+                payload.get("gamma_flip"),
+                payload.get("net_vanna"),
+                payload.get("net_charm"),
                 payload.get("vol_short"),
                 payload.get("vol_long"),
                 None if payload.get("vol_rising") is None else (1 if payload.get("vol_rising") else 0),
@@ -459,7 +651,8 @@ def fetch_alerts(db_path: str, limit: int) -> List[Dict[str, Any]]:
     try:
         rows = conn.execute(
             """
-            SELECT id, ts, regime, message, trigger_text, scenario, why_json, spot
+            SELECT id, ts, regime, message, trigger_text, scenario, confidence, why_json, levels_json, coverage_json,
+                   gamma_flip, net_vanna, net_charm, spot
             FROM alerts
             ORDER BY id DESC
             LIMIT ?
@@ -476,7 +669,13 @@ def fetch_alerts(db_path: str, limit: int) -> List[Dict[str, Any]]:
                     "message": r["message"],
                     "trigger_text": r["trigger_text"],
                     "scenario": r["scenario"],
+                    "confidence": r["confidence"],
                     "why": json.loads(r["why_json"] or "[]"),
+                    "levels": json.loads(r["levels_json"] or "{}"),
+                    "coverage": json.loads(r["coverage_json"] or "{}"),
+                    "gamma_flip": r["gamma_flip"],
+                    "net_vanna": r["net_vanna"],
+                    "net_charm": r["net_charm"],
                     "spot": r["spot"],
                 }
             )
@@ -833,7 +1032,7 @@ class TitanEngine:
                     snap_err = self._cached_options_err
 
                 exposures_t0 = time.perf_counter()
-                exposures, n_contracts, exp_reason, options_age_s = compute_exposures_from_snapshot(
+                exposures, levels, n_contracts, exp_reason, options_age_s = compute_exposures_from_snapshot(
                     snapshot_results, float(spot)
                 )
                 GLOBAL_STATE["exposures_ms"] = float((time.perf_counter() - exposures_t0) * 1000.0)
@@ -844,6 +1043,12 @@ class TitanEngine:
                 GLOBAL_STATE["net_vex"] = exposures.get("net_vex")
                 GLOBAL_STATE["net_cex"] = exposures.get("net_cex")
                 GLOBAL_STATE["net_delta"] = exposures.get("net_delta")
+                GLOBAL_STATE["gamma_flip"] = levels.get("gamma_flip")
+                GLOBAL_STATE["gamma_walls"] = levels.get("gamma_walls")
+                GLOBAL_STATE["net_vanna"] = levels.get("net_vanna")
+                GLOBAL_STATE["net_charm"] = levels.get("net_charm")
+                GLOBAL_STATE["coverage"] = levels.get("coverage")
+                GLOBAL_STATE["confidence"] = levels.get("confidence")
 
                 d_gex, d_delta = self._compute_derivatives(now_s, exposures.get("net_gex"), exposures.get("net_delta"))
                 GLOBAL_STATE["d_gex"] = d_gex
@@ -900,6 +1105,12 @@ class TitanEngine:
                         f"abs(d_delta)={abs(d_delta):.2f} > p{cfg.d_delta_percentile:.0f}={d_delta_thr:.2f}",
                         f"spot_stall=True (30s move={stall_frac:.5f})",
                     ]
+                    if levels.get("gamma_flip") is not None:
+                        why.append(f"gamma_flip_proxy={levels['gamma_flip']:.2f} (call+/put- OI-gamma)")
+                    if levels.get("net_charm") is not None:
+                        why.append(f"charm_proxy={levels['net_charm']:.2f} (BS, IV from Polygon)")
+                    if levels.get("net_vanna") is not None:
+                        why.append(f"vanna_proxy={levels['net_vanna']:.2f} (BS, IV from Polygon)")
                     scenario = self._scenario_text(regime, exposures.get("net_gex"), d_delta, vol_rising, stall)
 
                 # FLUSH: only if vol_rising true
@@ -922,6 +1133,9 @@ class TitanEngine:
                         "net_gex<0 (short gamma)",
                         "d_delta<0 (hedge selling accelerating)",
                     ]
+                    if levels.get("gamma_walls"):
+                        top = levels["gamma_walls"][0]
+                        why.append(f"top_gamma_wall_proxy={top['strike']:.2f}")
                     scenario = self._scenario_text(regime, exposures.get("net_gex"), d_delta, vol_rising, stall)
 
                 # CHARM: only if vol_rising false OR mean-reverting (optional)
@@ -942,6 +1156,9 @@ class TitanEngine:
                         "net_gex>0 (long gamma support)",
                         "abs(d_delta) below acceleration threshold",
                     ]
+                    if levels.get("gamma_walls"):
+                        top = levels["gamma_walls"][0]
+                        why.append(f"top_gamma_wall_proxy={top['strike']:.2f}")
                     scenario = self._scenario_text(regime, exposures.get("net_gex"), d_delta, vol_rising, stall)
 
                 # Emit alert (with cooldown, and only if computed inputs exist)
@@ -953,7 +1170,15 @@ class TitanEngine:
                         "message": message,
                         "trigger_text": trigger_text,
                         "scenario": scenario,
+                        "confidence": levels.get("confidence"),
                         "why": why,
+                        "levels": {
+                            "gamma_flip": levels.get("gamma_flip"),
+                            "gamma_walls": levels.get("gamma_walls"),
+                            "net_vanna": levels.get("net_vanna"),
+                            "net_charm": levels.get("net_charm"),
+                        },
+                        "coverage": levels.get("coverage"),
                         "spot": float(spot),
                         "net_gex": exposures.get("net_gex"),
                         "net_vex": exposures.get("net_vex"),
@@ -961,6 +1186,9 @@ class TitanEngine:
                         "net_delta": exposures.get("net_delta"),
                         "d_gex": d_gex,
                         "d_delta": d_delta,
+                        "gamma_flip": levels.get("gamma_flip"),
+                        "net_vanna": levels.get("net_vanna"),
+                        "net_charm": levels.get("net_charm"),
                         "vol_short": vol_short,
                         "vol_long": vol_long,
                         "vol_rising": vol_rising,
@@ -1171,6 +1399,13 @@ def build_app(cfg: TitanConfig) -> FastAPI:
                     "last_alert_id": GLOBAL_STATE.get("last_alert_id"),
                     "why": GLOBAL_STATE.get("why") or [],
                     "scenario": GLOBAL_STATE.get("scenario"),
+                    "proxy_label": GLOBAL_STATE.get("proxy_label"),
+                    "coverage": GLOBAL_STATE.get("coverage"),
+                    "confidence": GLOBAL_STATE.get("confidence"),
+                    "gamma_flip": GLOBAL_STATE.get("gamma_flip"),
+                    "gamma_walls": GLOBAL_STATE.get("gamma_walls"),
+                    "net_vanna": GLOBAL_STATE.get("net_vanna"),
+                    "net_charm": GLOBAL_STATE.get("net_charm"),
                     # charts
                     "spot_series": GLOBAL_STATE.get("spot_series") or [],
                     "vol_series": GLOBAL_STATE.get("vol_series") or [],

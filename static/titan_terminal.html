@@ -177,6 +177,7 @@
           <div class="cardBody">
             <div class="v" id="triggerText">NEUTRAL: Wait for structure.</div>
             <div class="muted" style="margin-top:6px;" id="scenarioText">Most likely scenario: N/A</div>
+            <div class="muted" style="margin-top:6px;" id="proxyLine">Dealer-exposure proxy (OI+greeks) • Coverage: N/A • Confidence: N/A</div>
             <ul class="why" id="whyList"></ul>
             <div style="height:10px;"></div>
             <div class="row">
@@ -187,6 +188,9 @@
               <div class="kv"><div class="k">Net Delta</div><div class="v mono" id="netDelta">N/A</div></div>
               <div class="kv"><div class="k">dGEX</div><div class="v mono" id="dGex">N/A</div></div>
               <div class="kv"><div class="k">dDelta</div><div class="v mono" id="dDelta">N/A</div></div>
+              <div class="kv"><div class="k">Gamma Flip (proxy)</div><div class="v mono" id="gammaFlip">N/A</div></div>
+              <div class="kv"><div class="k">Net Vanna (proxy)</div><div class="v mono" id="netVanna">N/A</div></div>
+              <div class="kv"><div class="k">Net Charm (proxy)</div><div class="v mono" id="netCharm">N/A</div></div>
               <div class="kv"><div class="k">Vol Rising</div><div class="v mono" id="volRising">N/A</div></div>
               <div class="kv"><div class="k">Short / Long vol</div><div class="v mono" id="volVals">N/A</div></div>
             </div>
@@ -528,6 +532,9 @@
         $("netDelta").innerText = fmtNum(p.net_delta);
         $("dGex").innerText = fmtNum(p.d_gex);
         $("dDelta").innerText = fmtNum(p.d_delta);
+        $("gammaFlip").innerText = (p.gamma_flip !== null && p.gamma_flip !== undefined) ? fmtNum(p.gamma_flip) : "N/A";
+        $("netVanna").innerText = fmtNum(p.net_vanna);
+        $("netCharm").innerText = fmtNum(p.net_charm);
         $("volRising").innerText = fmtBool(p.vol_rising);
         $("volVals").innerText = (p.vol_short !== null && p.vol_short !== undefined && p.vol_long !== null && p.vol_long !== undefined)
           ? `${fmtNum(p.vol_short)} / ${fmtNum(p.vol_long)}` : "N/A";
@@ -541,6 +548,13 @@
 
         setRegimeUI(p.regime || "NEUTRAL", p.trigger_text, p.why || []);
         $("scenarioText").innerText = p.scenario ? `Most likely scenario: ${p.scenario}` : "Most likely scenario: N/A";
+        // Proxy labeling + coverage/confidence (never imply true dealer book)
+        const cov = p.coverage || null;
+        const covGreeks = (cov && cov.coverage_greeks !== null && cov.coverage_greeks !== undefined) ? (100*cov.coverage_greeks).toFixed(0) + "%" : "N/A";
+        const covModel = (cov && cov.coverage_model !== null && cov.coverage_model !== undefined) ? (100*cov.coverage_model).toFixed(0) + "%" : "N/A";
+        const conf = p.confidence || "N/A";
+        const label = p.proxy_label || "Dealer-exposure proxy (OI+greeks)";
+        $("proxyLine").innerText = `${label} • Coverage: greeks ${covGreeks}, model ${covModel} • Confidence: ${conf}`;
 
         // Market closed banner + archive fallback
         const closed = (p.engine_status === "MARKET_CLOSED") || (p.market_session === "CLOSED");
