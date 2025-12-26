@@ -1,10 +1,10 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import TitanOmegaHolyGrail from './TitanOmegaHolyGrail';
+import TitanOmegaUltimateDashboard from './TitanOmegaUltimateDashboard';
 import './index.css';
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <TitanOmegaHolyGrail />
+    <TitanOmegaUltimateDashboard />
   </React.StrictMode>
 );
