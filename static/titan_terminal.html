@@ -178,6 +178,10 @@
             <div class="v" id="triggerText">NEUTRAL: Wait for structure.</div>
             <div class="muted" style="margin-top:6px;" id="scenarioText">Most likely scenario: N/A</div>
             <div class="muted" style="margin-top:6px;" id="proxyLine">Dealer-exposure proxy (OI+greeks) • Coverage: N/A • Confidence: N/A</div>
+            <div class="muted" style="margin-top:6px;">
+              <span style="text-transform:uppercase; letter-spacing:0.10em;">Gamma Walls (proxy)</span>:
+              <span class="mono" id="gammaWallsTop3">N/A</span>
+            </div>
             <ul class="why" id="whyList"></ul>
             <div style="height:10px;"></div>
             <div class="row">
@@ -252,6 +256,10 @@
         <div style="height:10px;"></div>
         <div class="v" id="drawerMsg">N/A</div>
         <div class="muted" id="drawerTrigger" style="margin-top:6px;">N/A</div>
+        <div class="muted" style="margin-top:8px;">
+          <span style="text-transform:uppercase; letter-spacing:0.10em;">Gamma Walls (proxy)</span>:
+          <span class="mono" id="drawerGammaWalls">N/A</span>
+        </div>
         <ul class="why" id="drawerWhy"></ul>
       </div>
     </div>
@@ -384,6 +392,20 @@
         return "neutral";
       }
 
+      function fmtGammaWallsTop3(walls) {
+        if (!Array.isArray(walls) || walls.length === 0) return "N/A";
+        const top3 = walls.slice(0,3);
+        const parts = [];
+        for (const w of top3) {
+          if (!w || w.strike === null || w.strike === undefined || Number.isNaN(w.strike)) continue;
+          const g = (w.gex === null || w.gex === undefined || Number.isNaN(w.gex)) ? null : w.gex;
+          // Show strike plus sign of proxy gex (not magnitude) for speed.
+          const sgn = (g === null) ? "" : (g > 0 ? "+" : (g < 0 ? "-" : "0"));
+          parts.push(`${fmtNum(w.strike)}${sgn}`);
+        }
+        return parts.length ? parts.join("  |  ") : "N/A";
+      }
+
       function renderAlerts() {
         const root = $("alertsList");
         root.innerHTML = "";
@@ -416,6 +438,9 @@
         if (a.scenario) {
           $("drawerTrigger").innerText = `${$("drawerTrigger").innerText} — ${a.scenario}`;
         }
+        // Gamma walls from archive payload (levels_json stored in SQLite)
+        const walls = a.levels?.gamma_walls || null;
+        $("drawerGammaWalls").innerText = fmtGammaWallsTop3(walls);
         const ul = $("drawerWhy");
         ul.innerHTML = "";
         for (const w of (a.why || [])) {
@@ -548,6 +573,7 @@
 
         setRegimeUI(p.regime || "NEUTRAL", p.trigger_text, p.why || []);
         $("scenarioText").innerText = p.scenario ? `Most likely scenario: ${p.scenario}` : "Most likely scenario: N/A";
+        $("gammaWallsTop3").innerText = fmtGammaWallsTop3(p.gamma_walls);
         // Proxy labeling + coverage/confidence (never imply true dealer book)
         const cov = p.coverage || null;
         const covGreeks = (cov && cov.coverage_greeks !== null && cov.coverage_greeks !== undefined) ? (100*cov.coverage_greeks).toFixed(0) + "%" : "N/A";
