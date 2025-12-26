@@ -1,16 +1,15 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import polygonService from './services/PolygonService';
+import massiveService from './services/MassiveService';
 import { buildGEXProfile, detectScenarios, buildWeeklyAnalysis } from './services/GEXCalculator';
 
 /**
  * TITAN OMEGA - LIVE GEX DASHBOARD
  * 
- * REAL DATA ONLY - NO SIMULATIONS
+ * Real-time streaming data from Massive.com WebSocket API
  * 
  * Data Sources:
- * - I:SPX → Real S&P 500 Index (Indices Subscription)
- * - I:VIX → Real VIX Index (Indices Subscription)
- * - SPX/SPY Options → Real options chain (Options Developer)
+ * - wss://socket.massive.com/indices → SPX, VIX (real-time)
+ * - wss://socket.massive.com/stocks → SPY, QQQ (real-time)
  */
 
 // ═══════════════════════════════════════════════════════════════════════════════════════
@@ -69,16 +68,13 @@ const GEXHeatmapBar = ({ strike, gex, spot, gammaFlip, callWall, putWall, maxGEX
   );
 };
 
-const ScenarioCard = ({ scenario, onSelect }) => {
+const ScenarioCard = ({ scenario }) => {
   const bgColor = scenario.alert 
     ? 'bg-gradient-to-r from-yellow-500/20 to-orange-500/20 border-yellow-500/50' 
     : 'bg-gray-900/50 border-gray-800';
 
   return (
-    <div 
-      className={`p-3 rounded-xl border ${bgColor} cursor-pointer hover:scale-[1.01] transition-all ${scenario.alert ? 'animate-pulse' : ''}`}
-      onClick={() => onSelect?.(scenario)}
-    >
+    <div className={`p-3 rounded-xl border ${bgColor} ${scenario.alert ? 'animate-pulse' : ''}`}>
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
           <span className="text-2xl">{scenario.direction === 'LONG' ? '🟢' : '🔴'}</span>
@@ -149,12 +145,7 @@ const AlertPopup = ({ alert, onDismiss }) => {
               <span className="text-gray-400">Target: <span className="text-emerald-400 font-mono">{alert.targets?.[0]?.toFixed(2)}</span></span>
             </div>
           </div>
-          <button 
-            onClick={onDismiss} 
-            className="text-white/50 hover:text-white text-3xl font-light"
-          >
-            ×
-          </button>
+          <button onClick={onDismiss} className="text-white/50 hover:text-white text-3xl font-light">×</button>
         </div>
       </div>
     </div>
@@ -188,39 +179,36 @@ const TimeWindow = ({ time }) => {
   const h = time.getHours() + time.getMinutes() / 60;
   const dow = time.getDay();
 
-  let window = { name: 'CLOSED', icon: '🌙', quality: 0, canTrade: false, color: 'gray' };
+  let window = { name: 'CLOSED', icon: '🌙', quality: 0, canTrade: false };
   
   if (dow === 0 || dow === 6) {
-    window = { name: 'WEEKEND', icon: '🚫', quality: 0, canTrade: false, color: 'gray', desc: 'Markets closed' };
+    window = { name: 'WEEKEND', icon: '🚫', quality: 0, canTrade: false, desc: 'Markets closed' };
   } else if (dow === 5 && h > 14) {
-    window = { name: 'FRI CLOSE', icon: '⚠️', quality: 20, canTrade: false, color: 'yellow', desc: 'Avoid - Low quality' };
+    window = { name: 'FRI CLOSE', icon: '⚠️', quality: 20, canTrade: false, desc: 'Avoid' };
   } else if (h >= 9.5 && h < 10.5) {
-    window = { name: 'OPENING', icon: '🌅', quality: 85, canTrade: true, color: 'emerald', desc: 'High volatility, breakouts' };
+    window = { name: 'OPENING', icon: '🌅', quality: 85, canTrade: true, desc: 'High volatility' };
   } else if (h >= 10.5 && h < 11) {
-    window = { name: 'MID MORN', icon: '☀️', quality: 70, canTrade: true, color: 'emerald', desc: 'Trend continuation' };
+    window = { name: 'MID MORN', icon: '☀️', quality: 70, canTrade: true, desc: 'Continuation' };
   } else if (h >= 11 && h < 11.75) {
-    window = { name: 'PRE-LUNCH', icon: '🎯', quality: 100, canTrade: true, color: 'yellow', desc: '⭐ PRIME REVERSAL WINDOW!' };
+    window = { name: 'PRE-LUNCH', icon: '🎯', quality: 100, canTrade: true, desc: '⭐ PRIME!' };
   } else if (h >= 11.75 && h < 14) {
-    window = { name: 'LUNCH', icon: '😴', quality: 10, canTrade: false, color: 'red', desc: 'Avoid - No follow-through' };
+    window = { name: 'LUNCH', icon: '😴', quality: 10, canTrade: false, desc: 'Avoid' };
   } else if (h >= 14 && h < 14.5) {
-    window = { name: 'EARLY PM', icon: '🌤️', quality: 60, canTrade: true, color: 'emerald', desc: 'Position building' };
+    window = { name: 'EARLY PM', icon: '🌤️', quality: 60, canTrade: true, desc: 'Building' };
   } else if (h >= 14.5 && h < 15.75) {
-    window = { name: 'POWER HR', icon: '⚡', quality: 95, canTrade: true, color: 'yellow', desc: '⭐ PRIME REVERSAL WINDOW!' };
+    window = { name: 'POWER HR', icon: '⚡', quality: 95, canTrade: true, desc: '⭐ PRIME!' };
   } else if (h >= 15.75 && h < 16) {
-    window = { name: 'CLOSE', icon: '🔔', quality: 50, canTrade: true, color: 'emerald', desc: 'EOD charm flows' };
+    window = { name: 'CLOSE', icon: '🔔', quality: 50, canTrade: true, desc: 'EOD flows' };
   } else if (h >= 4 && h < 9.5) {
-    window = { name: 'PRE-MKT', icon: '🌅', quality: 30, canTrade: false, color: 'gray', desc: 'Pre-market session' };
+    window = { name: 'PRE-MKT', icon: '🌅', quality: 30, canTrade: false, desc: 'Pre-market' };
   } else if (h >= 16 && h < 20) {
-    window = { name: 'AFTER-HRS', icon: '🌆', quality: 20, canTrade: false, color: 'gray', desc: 'After-hours session' };
+    window = { name: 'AFTER-HRS', icon: '🌆', quality: 20, canTrade: false, desc: 'After-hours' };
   }
 
   return (
     <div className={`px-4 py-3 rounded-xl border flex items-center gap-3 ${
-      window.quality >= 90 
-        ? 'bg-yellow-500/20 border-yellow-500/50 ring-2 ring-yellow-500/20' 
-        : window.canTrade 
-          ? 'bg-emerald-500/10 border-emerald-500/30' 
-          : 'bg-gray-800 border-gray-700'
+      window.quality >= 90 ? 'bg-yellow-500/20 border-yellow-500/50 ring-2 ring-yellow-500/20' : 
+      window.canTrade ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-gray-800 border-gray-700'
     }`}>
       <span className="text-3xl">{window.icon}</span>
       <div className="flex-1">
@@ -229,111 +217,53 @@ const TimeWindow = ({ time }) => {
         </div>
         <div className="text-xs text-gray-400">{window.desc}</div>
       </div>
-      <div className={`w-14 h-14 rounded-full flex items-center justify-center ${
-        window.quality >= 90 ? 'bg-yellow-500/30 ring-2 ring-yellow-500/50' : 
-        window.quality >= 60 ? 'bg-emerald-500/20' : 
-        'bg-gray-700'
+      <div className={`w-12 h-12 rounded-full flex items-center justify-center ${
+        window.quality >= 90 ? 'bg-yellow-500/30' : window.quality >= 60 ? 'bg-emerald-500/20' : 'bg-gray-700'
       }`}>
-        <span className={`text-xl font-bold ${
-          window.quality >= 90 ? 'text-yellow-400' : 
-          window.quality >= 60 ? 'text-emerald-400' : 
-          'text-gray-500'
-        }`}>
-          {window.quality}
-        </span>
+        <span className={`text-lg font-bold ${
+          window.quality >= 90 ? 'text-yellow-400' : window.quality >= 60 ? 'text-emerald-400' : 'text-gray-500'
+        }`}>{window.quality}</span>
       </div>
     </div>
   );
 };
 
-const ConnectionStatus = ({ isConnected, dataSource, dataQuality, lastUpdate, error }) => (
-  <div className={`flex items-center gap-2 px-3 py-2 rounded-lg ${
-    dataQuality === 'EXCELLENT' ? 'bg-emerald-500/20' :
-    dataQuality === 'GOOD' ? 'bg-blue-500/20' :
-    isConnected ? 'bg-yellow-500/20' : 
-    error ? 'bg-red-500/20' : 'bg-gray-700'
-  }`}>
-    <div className={`w-2 h-2 rounded-full ${
-      dataQuality === 'EXCELLENT' ? 'bg-emerald-400 animate-pulse' :
-      dataQuality === 'GOOD' ? 'bg-blue-400 animate-pulse' :
-      isConnected ? 'bg-yellow-400 animate-pulse' : 
-      error ? 'bg-red-400' : 'bg-gray-500'
-    }`}></div>
-    <div className="text-sm">
-      <div className={`font-semibold ${
-        dataQuality === 'EXCELLENT' ? 'text-emerald-400' :
-        dataQuality === 'GOOD' ? 'text-blue-400' :
-        isConnected ? 'text-yellow-400' : 
-        error ? 'text-red-400' : 'text-gray-400'
-      }`}>
-        {dataQuality === 'EXCELLENT' ? 'REAL DATA' :
-         dataQuality === 'GOOD' ? 'INDEX DATA' :
-         isConnected ? 'CONNECTED' : 
-         error ? 'ERROR' : 'CONNECTING...'}
-      </div>
-      {dataSource && <div className="text-xs text-gray-500">{dataSource}</div>}
-    </div>
-  </div>
-);
-
-const WeeklyAnalysisPanel = ({ analysis }) => {
-  if (!analysis?.available) {
-    return (
-      <div className="bg-gray-900 rounded-xl border border-gray-800 p-3">
-        <div className="text-sm font-semibold text-gray-400 mb-3 flex items-center gap-2">
-          <span>📅</span> WEEKLY OUTLOOK
-        </div>
-        <div className="text-xs text-gray-500 text-center py-4">
-          Requires daily bars data
-        </div>
-      </div>
-    );
-  }
-
+const ConnectionStatus = ({ stocks, indices, error }) => {
+  const allConnected = stocks && indices;
+  const anyConnected = stocks || indices;
+  
   return (
-    <div className="bg-gray-900 rounded-xl border border-gray-800 p-3">
-      <div className="text-sm font-semibold text-gray-400 mb-3 flex items-center gap-2">
-        <span>📅</span> WEEKLY OUTLOOK
-      </div>
-      
-      <div className="space-y-2 text-xs">
-        {/* Week Summary */}
-        <div className={`p-2 rounded-lg ${
-          analysis.weekSummary.trend === 'BULLISH' 
-            ? 'bg-emerald-500/10 border border-emerald-500/20' 
-            : 'bg-red-500/10 border border-red-500/20'
+    <div className={`flex items-center gap-2 px-3 py-2 rounded-lg ${
+      allConnected ? 'bg-emerald-500/20' : anyConnected ? 'bg-yellow-500/20' : 'bg-red-500/20'
+    }`}>
+      <div className={`w-2 h-2 rounded-full ${
+        allConnected ? 'bg-emerald-400 animate-pulse' : anyConnected ? 'bg-yellow-400 animate-pulse' : 'bg-red-400'
+      }`}></div>
+      <div className="text-sm">
+        <div className={`font-semibold ${
+          allConnected ? 'text-emerald-400' : anyConnected ? 'text-yellow-400' : 'text-red-400'
         }`}>
-          <div className="flex justify-between">
-            <span className="text-gray-400">Week Trend</span>
-            <span className={analysis.weekSummary.trend === 'BULLISH' ? 'text-emerald-400' : 'text-red-400'}>
-              {analysis.weekSummary.trend} {analysis.weekSummary.change}
-            </span>
-          </div>
-          <div className="flex justify-between mt-1">
-            <span className="text-gray-500">Range</span>
-            <span className="text-gray-400">{analysis.weekSummary.low?.toFixed(0)} - {analysis.weekSummary.high?.toFixed(0)}</span>
-          </div>
+          {allConnected ? 'STREAMING' : anyConnected ? 'PARTIAL' : error ? 'ERROR' : 'CONNECTING...'}
         </div>
-
-        {/* Next Week Expectation */}
-        <div className="p-2 bg-gray-800 rounded-lg">
-          <div className="text-gray-400 mb-1">Next Week Range</div>
-          <div className="flex justify-between">
-            <span className="text-emerald-400">↑ {analysis.nextWeekExpectation.bullishTarget}</span>
-            <span className="text-gray-500">±{analysis.nextWeekExpectation.expectedRange} pts</span>
-            <span className="text-red-400">↓ {analysis.nextWeekExpectation.bearishTarget}</span>
-          </div>
-        </div>
-
-        {/* Outlook Notes */}
-        <div className="space-y-1">
-          {analysis.outlook.notes.map((note, i) => (
-            <div key={i} className="text-gray-400 text-xs flex items-center gap-1">
-              <span className="text-yellow-500">•</span> {note}
-            </div>
-          ))}
+        <div className="text-xs text-gray-500">
+          {stocks ? '✓' : '✗'} Stocks {indices ? '✓' : '✗'} Indices
         </div>
       </div>
+    </div>
+  );
+};
+
+const PriceDisplay = ({ label, data, showChange = true }) => {
+  if (!data?.price && !data?.value) return null;
+  
+  const price = data.price || data.value;
+  const source = data.source || 'UNKNOWN';
+  
+  return (
+    <div className="text-center">
+      <div className="text-xs text-gray-500">{label}</div>
+      <div className="text-2xl font-bold font-mono text-white">{price.toFixed(2)}</div>
+      <div className="text-xs text-gray-600">{source}</div>
     </div>
   );
 };
@@ -346,20 +276,16 @@ const TitanOmegaLive = () => {
   const [time, setTime] = useState(new Date());
   const [spot, setSpot] = useState(null);
   const [spxData, setSpxData] = useState(null);
+  const [spyData, setSpyData] = useState(null);
   const [vixData, setVixData] = useState(null);
   const [gexProfile, setGexProfile] = useState(null);
   const [scenarios, setScenarios] = useState([]);
   const [currentAlert, setCurrentAlert] = useState(null);
   const [bars, setBars] = useState([]);
-  const [dailyBars, setDailyBars] = useState([]);
-  const [optionsData, setOptionsData] = useState({ available: false, data: [] });
-  const [isConnected, setIsConnected] = useState(false);
-  const [dataQuality, setDataQuality] = useState('UNKNOWN');
+  const [connected, setConnected] = useState({ stocks: false, indices: false });
   const [lastUpdate, setLastUpdate] = useState(null);
   const [error, setError] = useState(null);
   const [commentary, setCommentary] = useState([]);
-  const [marketStatus, setMarketStatus] = useState(null);
-  const [weeklyAnalysis, setWeeklyAnalysis] = useState(null);
   const alertShownRef = useRef(new Set());
   const audioRef = useRef(null);
 
@@ -369,114 +295,134 @@ const TitanOmegaLive = () => {
       text,
       type,
       time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-    }, ...prev].slice(0, 25));
+    }, ...prev].slice(0, 30));
   }, []);
 
-  // Fetch all real data from Polygon
-  const fetchData = useCallback(async () => {
-    try {
-      setError(null);
-      addComment('🔄 Fetching real-time data...', 'info');
-      
-      // Get all data from consolidated fetch
-      const allData = await polygonService.getAllData();
-      
-      setMarketStatus(allData.marketStatus);
-      setDataQuality(allData.dataQuality);
-
-      // SPX Price
-      if (allData.spx) {
-        setSpxData(allData.spx);
-        setSpot(allData.spx.price);
-        setIsConnected(true);
-        
-        const changeStr = allData.spx.session?.changePercent 
-          ? `${allData.spx.session.changePercent >= 0 ? '+' : ''}${allData.spx.session.changePercent.toFixed(2)}%`
-          : '';
-        
-        addComment(
-          `📊 SPX: ${allData.spx.price.toFixed(2)} ${changeStr} [${allData.spx.source}]`, 
-          'data'
-        );
-      } else if (allData.lastSession?.spx) {
-        // Use last session during off-hours
-        setSpxData(allData.lastSession.spx);
-        setSpot(allData.lastSession.spx.price);
-        setIsConnected(false);
-        addComment(`📊 Using last session data from ${new Date(allData.lastSession.timestamp).toLocaleDateString()}`, 'info');
-      } else {
-        setIsConnected(false);
-        const spxError = allData.errors.find(e => e.source === 'SPX');
-        setError(spxError?.error || 'SPX data unavailable');
+  // Handle real-time data updates from WebSocket
+  const handleDataUpdate = useCallback((eventType, symbol, data) => {
+    setLastUpdate(new Date());
+    
+    if (eventType === 'initial' || eventType === 'index') {
+      // Handle initial REST load or WebSocket index updates
+      if (data?.SPX?.price) {
+        setSpxData(data.SPX);
+        setSpot(data.SPX.price);
+        const source = data.SPX.source || 'UNKNOWN';
+        addComment(`📊 SPX: ${data.SPX.price.toFixed(2)} [${source}]`, 'data');
       }
-
-      // VIX
-      if (allData.vix) {
-        setVixData(allData.vix);
-        addComment(`📈 VIX: ${allData.vix.value.toFixed(2)} [${allData.vix.source}]`, 'data');
+      if (data?.VIX?.value) {
+        setVixData(data.VIX);
+        addComment(`📈 VIX: ${data.VIX.value.toFixed(2)} [${data.VIX.source}]`, 'data');
       }
-
-      // Options Chain
-      if (allData.options?.available) {
-        setOptionsData(allData.options);
-        addComment(`📋 Options: ${allData.options.count} contracts${allData.options.scaledFromSPY ? ' (SPY scaled)' : ''} [REAL]`, 'data');
-      } else {
-        setOptionsData({ available: false, data: [] });
-        if (allData.options?.error) {
-          addComment(`⚠️ Options: ${allData.options.error}`, 'error');
+    } else if (eventType === 'bar') {
+      if (symbol === 'SPY') {
+        setSpyData(data);
+        // If no direct SPX, use SPY proxy
+        if (!spxData?.price) {
+          const spxProxy = data.close * 10;
+          setSpot(spxProxy);
+          addComment(`📊 SPX (via SPY): ${spxProxy.toFixed(2)}`, 'data');
         }
+      } else if (symbol === 'SPX') {
+        setSpxData({ price: data.close, ...data, source: 'MASSIVE_AM' });
+        setSpot(data.close);
+        addComment(`📊 SPX: ${data.close.toFixed(2)} [AM BAR]`, 'data');
       }
-
-      // Intraday Bars
-      if (allData.bars?.length > 0) {
-        setBars(allData.bars);
-        addComment(`📈 Loaded ${allData.bars.length} intraday bars`, 'data');
+      setBars(prev => [data, ...prev].slice(0, 100));
+    } else if (eventType === 'trade') {
+      if (symbol === 'SPY' && !spxData?.price) {
+        const spxProxy = data.price * 10;
+        setSpot(spxProxy);
       }
+    }
+  }, [addComment, spxData]);
 
-      // Daily Bars
-      if (allData.dailyBars?.length > 0) {
-        setDailyBars(allData.dailyBars);
-        addComment(`📊 Loaded ${allData.dailyBars.length} daily bars for weekly analysis`, 'data');
-      }
-
-      // Log any errors
-      for (const err of allData.errors) {
-        console.warn(`${err.source}: ${err.error}`);
-      }
-
-      setLastUpdate(new Date());
-      addComment(`✅ Data quality: ${allData.dataQuality}`, 'info');
-      
-    } catch (err) {
-      console.error('Data fetch error:', err);
-      setError(err.message);
-      setIsConnected(false);
-      addComment(`❌ Error: ${err.message}`, 'error');
+  // Handle connection status changes
+  const handleConnectionStatus = useCallback(({ type, connected: isConnected, status }) => {
+    setConnected(prev => ({ ...prev, [type]: isConnected }));
+    
+    if (isConnected && status === 'authenticated') {
+      addComment(`✅ ${type.toUpperCase()} WebSocket connected & authenticated`, 'info');
+    } else if (!isConnected) {
+      addComment(`⚠️ ${type.toUpperCase()} disconnected`, 'error');
     }
   }, [addComment]);
 
-  // Build GEX profile when data changes
+  // Handle errors
+  const handleError = useCallback((errorMsg) => {
+    setError(errorMsg);
+    addComment(`❌ ${errorMsg}`, 'error');
+  }, [addComment]);
+
+  // Initialize WebSocket connections
+  useEffect(() => {
+    addComment('🚀 Connecting to Massive.com WebSocket...', 'info');
+    
+    // Set up callbacks
+    massiveService.setCallbacks({
+      onDataUpdate: handleDataUpdate,
+      onConnectionStatus: handleConnectionStatus,
+      onError: handleError,
+    });
+
+    // Connect to all feeds
+    massiveService.connectAll(false) // false = real-time, true = delayed
+      .then(results => {
+        if (results.errors.length > 0) {
+          results.errors.forEach(e => {
+            addComment(`⚠️ ${e.type}: ${e.error}`, 'error');
+          });
+        }
+        
+        // Load last session data if available
+        const lastSession = massiveService.getLastSession();
+        if (lastSession?.data) {
+          if (lastSession.data.SPX) {
+            setSpxData(lastSession.data.SPX);
+            setSpot(lastSession.data.SPX.price);
+            addComment(`📂 Loaded last session SPX: ${lastSession.data.SPX.price}`, 'info');
+          }
+          if (lastSession.data.VIX) {
+            setVixData(lastSession.data.VIX);
+          }
+          if (lastSession.data.SPY) {
+            setSpyData(lastSession.data.SPY);
+          }
+        }
+      })
+      .catch(err => {
+        setError(err.message);
+        addComment(`❌ Connection failed: ${err.message}`, 'error');
+      });
+
+    // Cleanup on unmount
+    return () => {
+      massiveService.disconnectAll();
+    };
+  }, [addComment, handleDataUpdate, handleConnectionStatus, handleError]);
+
+  // Update time every second
+  useEffect(() => {
+    const timer = setInterval(() => setTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Build GEX profile when spot changes
   useEffect(() => {
     if (!spot) return;
 
     const vix = vixData?.value || 15;
-    const optionsChain = optionsData?.available ? optionsData.data : [];
     
-    const profile = buildGEXProfile(spot, optionsChain, vix);
+    // Build GEX profile (model-based since we don't have options data)
+    const profile = buildGEXProfile(spot, null, vix);
     setGexProfile(profile);
 
-    // Build weekly analysis if we have daily bars
-    if (profile?.available && dailyBars.length > 0) {
-      const weekly = buildWeeklyAnalysis(profile, dailyBars);
-      setWeeklyAnalysis(weekly);
-    }
-
-    // Detect scenarios if GEX is available
+    // Detect scenarios
     if (profile?.available) {
       const detectedScenarios = detectScenarios(profile, bars, time);
       setScenarios(detectedScenarios);
 
-      // Check for high-confidence alerts
+      // Check for alerts
       const alertScenario = detectedScenarios.find(s => 
         s.alert && 
         s.confidence >= 75 && 
@@ -494,27 +440,11 @@ const TitanOmegaLive = () => {
         }
       }
     }
-  }, [spot, vixData, bars, dailyBars, optionsData, time, addComment]);
-
-  // Update time every second
-  useEffect(() => {
-    const timer = setInterval(() => setTime(new Date()), 1000);
-    return () => clearInterval(timer);
-  }, []);
-
-  // Initial data fetch and polling
-  useEffect(() => {
-    addComment('🚀 Connecting to Polygon.io (Real SPX + Options)...', 'info');
-    fetchData();
-    
-    // Poll every 15 seconds for real-time data
-    const interval = setInterval(fetchData, 15000);
-    return () => clearInterval(interval);
-  }, [fetchData, addComment]);
+  }, [spot, vixData, bars, time, addComment]);
 
   // Auto commentary
   useEffect(() => {
-    if (!gexProfile?.available) return;
+    if (!gexProfile?.available || !spot) return;
     
     const timer = setInterval(() => {
       const distToFlip = spot - gexProfile.gammaFlip;
@@ -525,15 +455,14 @@ const TitanOmegaLive = () => {
         `⚡ Gamma Flip: ${gexProfile.gammaFlip.toFixed(0)} | ${distToFlip > 0 ? 'ABOVE ✅' : 'BELOW ⚠️'} (${distToFlip.toFixed(1)} pts)`,
         `🧱 Call Wall: ${gexProfile.majorCallWall.toFixed(0)} | ${distToCallWall.toFixed(1)} pts away`,
         `💎 Put Wall: ${gexProfile.majorPutWall.toFixed(0)} | ${distToPutWall.toFixed(1)} pts away`,
-        `📊 Regime: ${gexProfile.regime} ${gexProfile.regimeStrength} | Net GEX: ${gexProfile.netGEX.toFixed(0)}M`,
-        `🌊 Vanna: ${gexProfile.netVanna > 0 ? 'BUY' : 'SELL'} flow | Charm: ${gexProfile.netCharm > 0 ? 'BUY' : 'SELL'} flow`,
-        `📡 Data: ${gexProfile.dataSource} | Options: ${optionsData.count || 0} contracts`,
+        `📊 Regime: ${gexProfile.regime} | VIX: ${vixData?.value?.toFixed(1) || '—'}`,
+        `📡 WebSocket: Stocks ${connected.stocks ? '✅' : '❌'} | Indices ${connected.indices ? '✅' : '❌'}`,
       ];
       addComment(comments[Math.floor(Math.random() * comments.length)]);
-    }, 12000);
+    }, 15000);
     
     return () => clearInterval(timer);
-  }, [gexProfile, spot, optionsData, addComment]);
+  }, [gexProfile, spot, vixData, connected, addComment]);
 
   // Loading state
   if (!spot) {
@@ -542,33 +471,34 @@ const TitanOmegaLive = () => {
         <div className="text-center">
           <div className="text-5xl mb-4 animate-bounce">🎯</div>
           <div className="text-xl font-semibold mb-2">TITAN OMEGA</div>
-          <div className="text-gray-400">Connecting to Polygon.io...</div>
-          <div className="text-gray-500 text-sm mt-2">Real SPX + VIX + Options</div>
-          {error && <div className="text-red-400 mt-2 text-sm">{error}</div>}
+          <div className="text-gray-400 mb-2">Connecting to Massive.com WebSocket...</div>
+          <div className="text-xs text-gray-600 space-y-1">
+            <div>Stocks: {connected.stocks ? '✅ Connected' : '⏳ Connecting...'}</div>
+            <div>Indices: {connected.indices ? '✅ Connected' : '⏳ Connecting...'}</div>
+          </div>
+          {error && <div className="text-red-400 mt-4 text-sm">{error}</div>}
         </div>
       </div>
     );
   }
 
-  // Build heatmap data
-  const heatmapData = gexProfile?.available && gexProfile?.heatmap
-    ? gexProfile.heatmap.filter(h => Math.abs(h.strike - spot) < 80)
-    : [];
-  
-  const maxGEX = heatmapData.length > 0 
-    ? Math.max(...heatmapData.map(h => Math.abs(h.netGEX)), 1) 
-    : 1;
-
+  // Computed values
   const distToFlip = gexProfile?.available ? spot - gexProfile.gammaFlip : 0;
   const distToCallWall = gexProfile?.available ? gexProfile.majorCallWall - spot : 0;
   const distToPutWall = gexProfile?.available ? spot - gexProfile.majorPutWall : 0;
+
+  // Build heatmap
+  const heatmapData = gexProfile?.available && gexProfile?.heatmap
+    ? gexProfile.heatmap.filter(h => Math.abs(h.strike - spot) < 80)
+    : [];
+  const maxGEX = heatmapData.length > 0 ? Math.max(...heatmapData.map(h => Math.abs(h.netGEX)), 1) : 1;
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 font-sans">
       {/* Alert Popup */}
       <AlertPopup alert={currentAlert} onDismiss={() => setCurrentAlert(null)} />
       
-      {/* Audio for alerts */}
+      {/* Audio */}
       <audio ref={audioRef} src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1lZWNfaWlneXuDg4KFhYaJhoeDgoKCgoODhIWFhYaGhoeHh4eHh4eHh4eGhoaFhYWEhIOCgYCAfn18e3p5eHd2dXRzcnFwb29ubm5ubm5ubm9vcHBxcnNzdHV2d3h5ent8fX6AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==" />
 
       {/* Header */}
@@ -584,11 +514,7 @@ const TitanOmegaLive = () => {
                 TITAN OMEGA
               </div>
               <div className="text-xs text-gray-500">
-                {gexProfile?.available 
-                  ? `🟢 REAL OPTIONS (${optionsData.count || 0} contracts)`
-                  : spxData?.isRealIndex 
-                    ? '🟡 REAL INDEX - Options unavailable' 
-                    : '⚪ LAST SESSION DATA'}
+                {connected.stocks && connected.indices ? '🟢 LIVE STREAMING' : '🟡 CONNECTING...'}
               </div>
             </div>
           </div>
@@ -597,13 +523,27 @@ const TitanOmegaLive = () => {
           <div className="flex items-center gap-6">
             {/* SPX Price */}
             <div className="text-center">
-              <div className="text-xs text-gray-500">SPX (Real Index)</div>
+              <div className="text-xs text-gray-500">SPX</div>
               <div className="text-2xl font-bold font-mono text-white">{spot.toFixed(2)}</div>
-              {spxData?.session?.changePercent !== undefined && (
-                <div className={`text-xs ${spxData.session.changePercent >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {spxData.session.changePercent >= 0 ? '+' : ''}{spxData.session.changePercent.toFixed(2)}%
-                </div>
-              )}
+              <div className="text-xs text-gray-600">{spxData?.source || (spyData ? 'SPY×10' : '')}</div>
+            </div>
+
+            {/* SPY Price */}
+            {spyData && (
+              <div className="text-center">
+                <div className="text-xs text-gray-500">SPY</div>
+                <div className="text-lg font-bold font-mono text-blue-400">{spyData.price?.toFixed(2) || spyData.close?.toFixed(2)}</div>
+              </div>
+            )}
+
+            {/* VIX */}
+            <div className="text-center">
+              <div className="text-xs text-gray-500">VIX</div>
+              <div className={`text-xl font-bold font-mono ${
+                (vixData?.value || 0) > 25 ? 'text-red-400' : (vixData?.value || 0) > 18 ? 'text-yellow-400' : 'text-emerald-400'
+              }`}>
+                {vixData?.value?.toFixed(1) || '—'}
+              </div>
             </div>
 
             {/* Gamma Flip */}
@@ -617,16 +557,6 @@ const TitanOmegaLive = () => {
               </div>
             )}
 
-            {/* VIX */}
-            <div className="text-center">
-              <div className="text-xs text-gray-500">VIX (Real)</div>
-              <div className={`text-xl font-bold font-mono ${
-                (vixData?.value || 0) > 25 ? 'text-red-400' : (vixData?.value || 0) > 18 ? 'text-yellow-400' : 'text-emerald-400'
-              }`}>
-                {vixData?.value?.toFixed(1) || '—'}
-              </div>
-            </div>
-
             {/* Regime */}
             {gexProfile?.available && (
               <div className={`px-4 py-2 rounded-xl ${
@@ -636,35 +566,17 @@ const TitanOmegaLive = () => {
               }`}>
                 <div className="text-xs opacity-75">Regime</div>
                 <div className="font-bold text-sm">
-                  {gexProfile.regime === 'POSITIVE' ? '+γ DAMPEN' : 
-                   gexProfile.regime === 'NEGATIVE' ? '-γ AMPLIFY' : 'NEUTRAL'}
+                  {gexProfile.regime === 'POSITIVE' ? '+γ DAMPEN' : '-γ AMPLIFY'}
                 </div>
               </div>
             )}
 
             {/* Connection Status */}
             <ConnectionStatus 
-              isConnected={isConnected} 
-              dataSource={spxData?.source}
-              dataQuality={dataQuality}
-              lastUpdate={lastUpdate}
+              stocks={connected.stocks} 
+              indices={connected.indices}
               error={error}
             />
-
-            {/* Market Status */}
-            {marketStatus && (
-              <div className={`px-3 py-1 rounded-lg text-xs ${
-                marketStatus.isOpen ? 'bg-emerald-500/20 text-emerald-400' :
-                marketStatus.afterHours ? 'bg-yellow-500/20 text-yellow-400' :
-                marketStatus.preMarket ? 'bg-blue-500/20 text-blue-400' :
-                'bg-gray-700 text-gray-400'
-              }`}>
-                {marketStatus.isOpen ? '🟢 OPEN' :
-                 marketStatus.afterHours ? '🟡 AFTER-HRS' :
-                 marketStatus.preMarket ? '🔵 PRE-MKT' :
-                 '⚪ CLOSED'}
-              </div>
-            )}
 
             {/* Time */}
             <div className="font-mono text-gray-400 text-lg tabular-nums">
@@ -676,28 +588,18 @@ const TitanOmegaLive = () => {
 
       {/* Main Content */}
       <main className="max-w-[1920px] mx-auto grid grid-cols-12 gap-3 p-3 h-[calc(100vh-80px)]">
-        {/* Left Panel - Time & Scenarios */}
+        {/* Left Panel */}
         <aside className="col-span-3 flex flex-col gap-3 overflow-auto">
-          {/* Time Window */}
           <TimeWindow time={time} />
 
-          {/* Weekly Analysis */}
-          <WeeklyAnalysisPanel analysis={weeklyAnalysis} />
-
-          {/* Active Scenarios */}
+          {/* Scenarios */}
           <div className="bg-gray-900 rounded-xl border border-gray-800 p-3 flex-1 overflow-auto">
             <div className="text-sm font-semibold text-gray-400 mb-3 flex items-center gap-2">
               <span>🎯</span> SCENARIOS
               <span className="ml-auto text-xs px-2 py-0.5 bg-gray-800 rounded">{scenarios.length}</span>
             </div>
-            {!gexProfile?.available ? (
-              <div className="text-xs text-gray-500 text-center py-4">
-                ⚠️ Real options data required for scenarios
-              </div>
-            ) : scenarios.length === 0 ? (
-              <div className="text-xs text-gray-500 text-center py-4">
-                No active scenarios - watching...
-              </div>
+            {scenarios.length === 0 ? (
+              <div className="text-xs text-gray-500 text-center py-4">Monitoring for setups...</div>
             ) : (
               <div className="space-y-2">
                 {scenarios.map((scenario, i) => (
@@ -715,16 +617,9 @@ const TitanOmegaLive = () => {
               <div className="flex items-center gap-2">
                 <span className="text-lg">📊</span>
                 <span className="font-semibold text-gray-300">GEX HEATMAP</span>
-                <span className={`text-xs px-2 py-0.5 rounded ${
-                  gexProfile?.available ? 'bg-emerald-500/20 text-emerald-400' : 'bg-yellow-500/20 text-yellow-400'
-                }`}>
-                  {gexProfile?.dataSource || 'NO DATA'}
+                <span className="text-xs px-2 py-0.5 rounded bg-yellow-500/20 text-yellow-400">
+                  MODEL
                 </span>
-                {optionsData.scaledFromSPY && (
-                  <span className="text-xs px-2 py-0.5 rounded bg-blue-500/20 text-blue-400">
-                    SPY→SPX
-                  </span>
-                )}
               </div>
               <div className="flex items-center gap-4 text-xs">
                 <div className="flex items-center gap-1">
@@ -738,17 +633,12 @@ const TitanOmegaLive = () => {
               </div>
             </div>
             <div className="flex-1 p-2 overflow-y-auto space-y-0.5">
-              {!gexProfile?.available ? (
+              {heatmapData.length === 0 ? (
                 <div className="h-full flex items-center justify-center text-gray-500">
                   <div className="text-center">
-                    <div className="text-3xl mb-2">⚠️</div>
-                    <div>Real options data required</div>
-                    <div className="text-xs mt-1">Options Developer subscription needed</div>
+                    <div className="text-3xl mb-2">📊</div>
+                    <div>Building GEX model...</div>
                   </div>
-                </div>
-              ) : heatmapData.length === 0 ? (
-                <div className="h-full flex items-center justify-center text-gray-500">
-                  No GEX data in range
                 </div>
               ) : (
                 heatmapData.map(h => (
@@ -774,7 +664,7 @@ const TitanOmegaLive = () => {
               <span className="text-sm font-semibold text-gray-400">LIVE ANALYSIS</span>
               <div className="ml-auto flex items-center gap-1">
                 <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></div>
-                <span className="text-xs text-gray-500">Live</span>
+                <span className="text-xs text-gray-500">Streaming</span>
               </div>
             </div>
             <div className="flex-1 p-2 overflow-y-auto space-y-1">
@@ -793,7 +683,7 @@ const TitanOmegaLive = () => {
           </div>
         </section>
 
-        {/* Right Panel - Key Levels & Info */}
+        {/* Right Panel */}
         <aside className="col-span-3 flex flex-col gap-3 overflow-auto">
           {/* Key Levels */}
           <div className="bg-gray-900 rounded-xl border border-gray-800 p-3">
@@ -832,62 +722,54 @@ const TitanOmegaLive = () => {
             <div className="space-y-2 text-xs">
               <div className="p-2 bg-red-500/10 border border-red-500/20 rounded-lg">
                 <div className="text-red-400 font-bold mb-1">🧱 CALL WALL → SHORT</div>
-                <div className="text-gray-400">Price hits wall → Dealers sell → Reversal DOWN</div>
+                <div className="text-gray-400">Dealers sell → Reversal DOWN</div>
               </div>
               <div className="p-2 bg-emerald-500/10 border border-emerald-500/20 rounded-lg">
                 <div className="text-emerald-400 font-bold mb-1">💎 PUT WALL → LONG</div>
-                <div className="text-gray-400">Price hits wall → Dealers buy → Reversal UP</div>
+                <div className="text-gray-400">Dealers buy → Reversal UP</div>
               </div>
               <div className="p-2 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
                 <div className="text-yellow-400 font-bold mb-1">⚡ GAMMA FLIP</div>
-                <div className="text-yellow-200/70">Cross = regime change, expect momentum</div>
-              </div>
-              <div className="p-2 bg-purple-500/10 border border-purple-500/20 rounded-lg">
-                <div className="text-purple-400 font-bold mb-1">🎯 A+ SETUP</div>
-                <div className="text-purple-200/70">Wall touch + Rejection + Prime time = 75%+</div>
+                <div className="text-yellow-200/70">Cross = momentum change</div>
               </div>
             </div>
           </div>
 
-          {/* Stats */}
-          {gexProfile?.available && (
-            <div className="bg-gray-900 rounded-xl border border-gray-800 p-3">
-              <div className="text-sm font-semibold text-gray-400 mb-3 flex items-center gap-2">
-                <span>📊</span> GEX STATS
-              </div>
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                <div className="p-2 bg-gray-800 rounded text-center">
-                  <div className="text-gray-500">Net GEX</div>
-                  <div className={`font-bold font-mono ${gexProfile.netGEX > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                    {gexProfile.netGEX.toFixed(0)}M
-                  </div>
-                </div>
-                <div className="p-2 bg-gray-800 rounded text-center">
-                  <div className="text-gray-500">Contracts</div>
-                  <div className="font-bold font-mono text-blue-400">
-                    {gexProfile.totalContracts}
-                  </div>
-                </div>
-                <div className="p-2 bg-gray-800 rounded text-center">
-                  <div className="text-gray-500">Vanna Flow</div>
-                  <div className={`font-bold ${gexProfile.netVanna > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                    {gexProfile.netVanna > 0 ? '↑ BUY' : '↓ SELL'}
-                  </div>
-                </div>
-                <div className="p-2 bg-gray-800 rounded text-center">
-                  <div className="text-gray-500">Charm Flow</div>
-                  <div className={`font-bold ${gexProfile.netCharm > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                    {gexProfile.netCharm > 0 ? '↑ BUY' : '↓ SELL'}
-                  </div>
-                </div>
-              </div>
-              {lastUpdate && (
-                <div className="mt-2 text-xs text-gray-500 text-center">
-                  Updated: {lastUpdate.toLocaleTimeString()}
-                </div>
-              )}
+          {/* Data Sources */}
+          <div className="bg-gray-900 rounded-xl border border-gray-800 p-3">
+            <div className="text-sm font-semibold text-gray-400 mb-3 flex items-center gap-2">
+              <span>📡</span> DATA SOURCES
             </div>
-          )}
+            <div className="space-y-2 text-xs">
+              <div className="flex justify-between items-center">
+                <span className="text-gray-500">SPX Index</span>
+                <span className={connected.indices ? 'text-emerald-400' : 'text-gray-500'}>
+                  {connected.indices ? '🟢 Live' : '⚪ Waiting'}
+                </span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-gray-500">VIX Index</span>
+                <span className={connected.indices ? 'text-emerald-400' : 'text-gray-500'}>
+                  {connected.indices ? '🟢 Live' : '⚪ Waiting'}
+                </span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-gray-500">SPY/QQQ</span>
+                <span className={connected.stocks ? 'text-emerald-400' : 'text-gray-500'}>
+                  {connected.stocks ? '🟢 Live' : '⚪ Waiting'}
+                </span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-gray-500">GEX Model</span>
+                <span className="text-yellow-400">📐 Calculated</span>
+              </div>
+            </div>
+            {lastUpdate && (
+              <div className="mt-2 text-xs text-gray-600 text-center">
+                Last: {lastUpdate.toLocaleTimeString()}
+              </div>
+            )}
+          </div>
         </aside>
       </main>
     </div>

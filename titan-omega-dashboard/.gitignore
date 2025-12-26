@@ -1,1 +1,4 @@
+# API Keys - NEVER COMMIT
 .env
+.env.local
+.env.*.local

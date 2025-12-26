@@ -68,24 +68,18 @@ export const calculateGreeks = (spot, strike, tte, iv, r = 0.05, type = 'call') 
 // ═══════════════════════════════════════════════════════════════════════════════════
 
 /**
- * Build GEX Profile from real options chain data
+ * Build GEX Profile from real options chain data or model
  * 
  * @param {number} spot - Current SPX price
- * @param {Array} optionsChain - Real options data from Polygon
- * @param {number} vix - Current VIX (for IV if needed)
- * @returns {Object} GEX Profile or unavailable status
+ * @param {Array} optionsChain - Real options data (optional)
+ * @param {number} vix - Current VIX (for IV)
+ * @returns {Object} GEX Profile
  */
 export const buildGEXProfile = (spot, optionsChain, vix = 15) => {
-  // If no real options data, return unavailable
+  // If no real options data, use model-based estimation
   if (!optionsChain || optionsChain.length === 0) {
-    console.log('⚠️ No real options data available - GEX cannot be calculated');
-    return {
-      available: false,
-      dataSource: 'NONE',
-      reason: 'Real options chain data required for GEX calculation',
-      spot,
-      timestamp: new Date(),
-    };
+    console.log('📐 Building GEX from MODEL (no real options data)');
+    return buildModelGEXProfile(spot, vix);
   }
 
   console.log(`📊 Building GEX from ${optionsChain.length} REAL options contracts`);
@@ -281,7 +275,162 @@ export const buildGEXProfile = (spot, optionsChain, vix = 15) => {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════════
-// SCENARIO DETECTION (Based on Real GEX Data)
+// MODEL-BASED GEX PROFILE (When no real options data)
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Build GEX Profile using model estimation
+ * Used when real options data is not available
+ */
+const buildModelGEXProfile = (spot, vix = 15) => {
+  const iv = vix / 100;
+  
+  // Round spot to nearest 5 points for strike alignment
+  const roundedSpot = Math.round(spot / 5) * 5;
+  
+  // Model parameters based on typical SPX options distribution
+  const strikeSpacing = 5; // SPX options typically at 5-point intervals
+  const numStrikes = 40; // 20 above, 20 below
+  const baseOI = 10000; // Base open interest
+  
+  // Build strikes and estimate GEX
+  const strikes = [];
+  const heatmap = [];
+  
+  let totalCallGEX = 0;
+  let totalPutGEX = 0;
+  let totalVanna = 0;
+  let totalCharm = 0;
+  
+  for (let i = -numStrikes / 2; i <= numStrikes / 2; i++) {
+    const strike = roundedSpot + (i * strikeSpacing);
+    const moneyness = strike / spot;
+    const distance = Math.abs(i);
+    
+    // Model: OI peaks at round numbers and ATM, decays away from spot
+    const roundBonus = (strike % 50 === 0) ? 2.5 : (strike % 25 === 0) ? 1.5 : 1;
+    const atmDecay = Math.exp(-0.08 * distance);
+    const estimatedCallOI = baseOI * roundBonus * atmDecay * (strike > spot ? 1.2 : 0.8);
+    const estimatedPutOI = baseOI * roundBonus * atmDecay * (strike < spot ? 1.2 : 0.8);
+    
+    // Calculate Greeks for model
+    const tte = 7 / 365; // Average 7 DTE
+    const callGreeks = calculateGreeks(spot, strike, tte, iv, 0.05, 'call');
+    const putGreeks = calculateGreeks(spot, strike, tte, iv, 0.05, 'put');
+    
+    if (!callGreeks || !putGreeks) continue;
+    
+    // GEX = Gamma * OI * 100 * Spot^2 / 1e6
+    // Dealers SHORT calls (negative gamma), LONG puts (positive gamma)
+    const callGEX = -(callGreeks.gamma || 0) * estimatedCallOI * 100 * spot * spot / 1e6;
+    const putGEX = (putGreeks.gamma || 0) * estimatedPutOI * 100 * spot * spot / 1e6;
+    const netGEX = callGEX + putGEX;
+    
+    totalCallGEX += callGEX;
+    totalPutGEX += putGEX;
+    
+    // Vanna and Charm contributions
+    const callVanna = (callGreeks.vanna || 0) * estimatedCallOI * 100;
+    const putVanna = (putGreeks.vanna || 0) * estimatedPutOI * 100;
+    totalVanna += -callVanna + putVanna;
+    
+    const callCharm = (callGreeks.charm || 0) * estimatedCallOI * 100;
+    const putCharm = (putGreeks.charm || 0) * estimatedPutOI * 100;
+    totalCharm += -callCharm + putCharm;
+    
+    strikes.push({
+      strike,
+      callGEX,
+      putGEX,
+      netGEX,
+      callOI: estimatedCallOI,
+      putOI: estimatedPutOI,
+    });
+    
+    heatmap.push({
+      strike,
+      netGEX,
+      callGEX,
+      putGEX,
+      callOI: estimatedCallOI,
+      putOI: estimatedPutOI,
+    });
+  }
+  
+  // Sort heatmap by strike descending
+  heatmap.sort((a, b) => b.strike - a.strike);
+  
+  // Find Gamma Flip (where GEX crosses zero)
+  let gammaFlip = roundedSpot;
+  let prevNetGEX = null;
+  for (const s of [...strikes].sort((a, b) => b.strike - a.strike)) {
+    if (prevNetGEX !== null && prevNetGEX * s.netGEX < 0) {
+      gammaFlip = s.strike;
+      break;
+    }
+    prevNetGEX = s.netGEX;
+  }
+  
+  // Find major walls (highest GEX levels)
+  const sortedByCallGEX = strikes.filter(s => s.strike > spot).sort((a, b) => Math.abs(b.callGEX) - Math.abs(a.callGEX));
+  const sortedByPutGEX = strikes.filter(s => s.strike < spot).sort((a, b) => Math.abs(b.putGEX) - Math.abs(a.putGEX));
+  
+  const majorCallWall = sortedByCallGEX[0]?.strike || spot + 50;
+  const majorPutWall = sortedByPutGEX[0]?.strike || spot - 50;
+  
+  // Determine regime
+  const netGEX = totalCallGEX + totalPutGEX;
+  const regime = netGEX > 0 ? 'POSITIVE' : 'NEGATIVE';
+  
+  return {
+    available: true,
+    dataSource: 'MODEL',
+    
+    spot,
+    timestamp: new Date(),
+    
+    // Key Levels
+    gammaFlip,
+    majorCallWall,
+    majorPutWall,
+    
+    // Walls with detail
+    callWalls: sortedByCallGEX.slice(0, 5).map(w => ({ strike: w.strike, gex: w.callGEX, oi: w.callOI })),
+    putWalls: sortedByPutGEX.slice(0, 5).map(w => ({ strike: w.strike, gex: w.putGEX, oi: w.putOI })),
+    
+    // Net Exposures
+    netGEX,
+    callGEX: totalCallGEX,
+    putGEX: totalPutGEX,
+    netVanna: totalVanna,
+    netCharm: totalCharm,
+    
+    // Regime
+    regime,
+    regimeStrength: Math.abs(netGEX) > 100 ? 'STRONG' : Math.abs(netGEX) > 50 ? 'MODERATE' : 'WEAK',
+    
+    // Strike Data
+    strikes,
+    heatmap,
+    
+    // Data Quality
+    totalContracts: 0,
+    contractsWithGreeks: 0,
+    contractsCalculated: strikes.length * 2,
+    
+    // Analysis
+    analysis: {
+      aboveGammaFlip: spot > gammaFlip,
+      nearCallWall: Math.abs(spot - majorCallWall) < 10,
+      nearPutWall: Math.abs(spot - majorPutWall) < 10,
+      vannaPositive: totalVanna > 0,
+      charmPositive: totalCharm > 0,
+    },
+  };
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// SCENARIO DETECTION (Based on GEX Data)
 // ═══════════════════════════════════════════════════════════════════════════════════
 
 /**
