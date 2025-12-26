@@ -1,17 +1,13 @@
 /**
- * MassiveService (Polygon-backed)
+ * MassiveService (secure mode)
  *
- * Provides:
- * - WebSocket streaming for indices (SPX/VIX) via Polygon
- * - REST fallback to previous day aggregates
- * - After-hours persistence via localStorage
+ * Frontend talks ONLY to our backend proxy:
+ * - WebSocket: `ws(s)://<host>/stream`
+ * - REST:      `/api/*`
  *
- * Env:
- * - Prefer `VITE_POLYGON_API_KEY`, fall back to `VITE_MASSIVE_API_KEY`.
+ * This keeps API keys out of the browser bundle.
  */
 
-const API_KEY = import.meta.env.VITE_POLYGON_API_KEY || import.meta.env.VITE_MASSIVE_API_KEY;
-const BASE_URL = 'https://api.polygon.io';
 const STORAGE_KEY = 'titan_omega_session_v1';
 
 function safeJsonParse(s) {
@@ -24,9 +20,9 @@ function safeJsonParse(s) {
 
 class MassiveService {
   constructor() {
-    this.ws = null;
-    this.connected = { indices: false };
-    this.authenticated = { indices: false };
+    this.ws = null; // connection to our backend (/stream)
+    this.connected = { backend: false, indices: false };
+    this.authenticated = { backend: false, indices: false };
     this.data = {
       SPX: null,
       VIX: null,
@@ -82,12 +78,14 @@ class MassiveService {
       }
     }
     this.ws = null;
+    this.connected.backend = false;
+    this.authenticated.backend = false;
     this.connected.indices = false;
     this.authenticated.indices = false;
   }
 
-  isConnected(type = 'indices') {
-    return Boolean(this.authenticated[type]);
+  isConnected(type = 'backend') {
+    return Boolean(this.connected[type]);
   }
 
   getData() {
@@ -113,18 +111,12 @@ class MassiveService {
   }
 
   async fetchPreviousDayData() {
-    if (!API_KEY) return null;
+    const res = await fetch('/api/prev');
+    const json = await res.json();
+    if (!res.ok || !json?.ok) throw new Error(json?.error || 'REST /api/prev failed');
 
-    const [spxRes, vixRes] = await Promise.all([
-      fetch(`${BASE_URL}/v2/aggs/ticker/I:SPX/prev?apiKey=${encodeURIComponent(API_KEY)}`),
-      fetch(`${BASE_URL}/v2/aggs/ticker/I:VIX/prev?apiKey=${encodeURIComponent(API_KEY)}`),
-    ]);
-
-    const spxJson = await spxRes.json();
-    const vixJson = await vixRes.json();
-
-    const spx = spxJson?.results?.[0];
-    if (spx) {
+    const spx = json?.spx;
+    if (spx?.c != null) {
       this.data.SPX = {
         price: spx.c,
         open: spx.o,
@@ -132,19 +124,19 @@ class MassiveService {
         low: spx.l,
         volume: spx.v,
         timestamp: new Date(spx.t),
-        source: 'REST_PREV_DAY',
+        source: 'REST_PREV_DAY_PROXY',
       };
     }
 
-    const vix = vixJson?.results?.[0];
-    if (vix) {
+    const vix = json?.vix;
+    if (vix?.c != null) {
       this.data.VIX = {
         value: vix.c,
         open: vix.o,
         high: vix.h,
         low: vix.l,
         timestamp: new Date(vix.t),
-        source: 'REST_PREV_DAY',
+        source: 'REST_PREV_DAY_PROXY',
       };
     }
 
@@ -153,95 +145,76 @@ class MassiveService {
   }
 
   connectIndices() {
-    if (!API_KEY) {
-      throw new Error('API key not configured (set VITE_POLYGON_API_KEY)');
-    }
-
-    const endpoint = 'wss://socket.polygon.io/indices';
     this.disconnectAll();
 
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const endpoint = `${proto}://${window.location.host}/stream`;
     const ws = new WebSocket(endpoint);
     this.ws = ws;
 
     ws.onopen = () => {
-      this.connected.indices = true;
-      this.onConnectionStatus?.({ type: 'indices', connected: true, status: 'connected' });
-      ws.send(JSON.stringify({ action: 'auth', params: API_KEY }));
+      this.connected.backend = true;
+      this.authenticated.backend = true; // our proxy handles auth upstream
+      this.onConnectionStatus?.({ type: 'backend', connected: true, status: 'connected' });
     };
 
     ws.onmessage = (event) => {
       const messages = safeJsonParse(event.data);
       if (!messages) return;
-      const list = Array.isArray(messages) ? messages : [messages];
 
-      for (const msg of list) {
-        if (msg?.ev === 'status') {
-          if (msg.status === 'auth_success') {
-            this.authenticated.indices = true;
-            this.onConnectionStatus?.({ type: 'indices', connected: true, status: 'authenticated' });
-            ws.send(JSON.stringify({ action: 'subscribe', params: 'V.I:SPX,V.I:VIX,AM.I:SPX,AM.I:VIX' }));
-          } else if (msg.status === 'auth_failed') {
-            this.authenticated.indices = false;
-            this.onError?.(msg.message || 'auth_failed');
-            this.onConnectionStatus?.({ type: 'indices', connected: false, status: 'auth_failed' });
-          }
-          continue;
+      // Proxy message formats:
+      // - { type: 'snapshot', data: { status, SPX, VIX } }
+      // - { type: 'status', status: {...} }
+      // - { type: 'SPX', data: {...} }
+      // - { type: 'VIX', data: {...} }
+      if (messages.type === 'snapshot') {
+        const snap = messages.data || {};
+        if (snap.SPX) this.data.SPX = snap.SPX;
+        if (snap.VIX) this.data.VIX = snap.VIX;
+        if (snap.status) {
+          this.connected.indices = Boolean(snap.status.connected);
+          this.authenticated.indices = Boolean(snap.status.authenticated);
         }
+        this.saveSession();
+        this.onDataUpdate?.('initial', 'SNAPSHOT', this.data);
+        return;
+      }
 
-        if (msg?.ev === 'V') {
-          const sym = String(msg.T || '').replace('I:', '');
-          const val = Number(msg.val ?? msg.v);
-          const t = msg.t ? new Date(msg.t) : new Date();
+      if (messages.type === 'status') {
+        const st = messages.status || {};
+        this.connected.indices = Boolean(st.connected);
+        this.authenticated.indices = Boolean(st.authenticated);
+        this.onConnectionStatus?.({ type: 'indices', connected: this.connected.indices, status: st.authenticated ? 'authenticated' : 'connected' });
+        return;
+      }
 
-          if (sym === 'SPX') {
-            this.data.SPX = { price: val, timestamp: t, source: 'WS_V' };
-            this.saveSession();
-            this.onDataUpdate?.('index', 'SPX', this.data);
-          } else if (sym === 'VIX') {
-            this.data.VIX = { value: val, timestamp: t, source: 'WS_V' };
-            this.saveSession();
-            this.onDataUpdate?.('index', 'VIX', this.data);
-          }
-          continue;
-        }
+      if (messages.type === 'SPX') {
+        this.data.SPX = { ...messages.data, source: messages.data?.source || 'WS_PROXY' };
+        this.saveSession();
+        this.onDataUpdate?.('index', 'SPX', this.data);
+        return;
+      }
 
-        if (msg?.ev === 'AM') {
-          const sym = String(msg.sym || '').replace('I:', '');
-          if (sym !== 'SPX') continue;
-
-          const bar = {
-            timestamp: msg.s ? new Date(msg.s) : new Date(),
-            open: msg.o,
-            high: msg.h,
-            low: msg.l,
-            close: msg.c,
-            volume: msg.v,
-            source: 'WS_AM',
-          };
-
-          this.data.bars.SPX.unshift(bar);
-          if (this.data.bars.SPX.length > 500) this.data.bars.SPX.pop();
-
-          // Keep last price in sync
-          this.data.SPX = { price: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
-
-          this.saveSession();
-          this.onDataUpdate?.('bar', 'SPX', bar);
-        }
+      if (messages.type === 'VIX') {
+        this.data.VIX = { ...messages.data, source: messages.data?.source || 'WS_PROXY' };
+        this.saveSession();
+        this.onDataUpdate?.('index', 'VIX', this.data);
       }
     };
 
     ws.onerror = () => {
-      this.onError?.('WebSocket error');
+      this.onError?.('WebSocket error (proxy)');
+      this.connected.backend = false;
       this.connected.indices = false;
       this.authenticated.indices = false;
-      this.onConnectionStatus?.({ type: 'indices', connected: false, status: 'error' });
+      this.onConnectionStatus?.({ type: 'backend', connected: false, status: 'error' });
     };
 
     ws.onclose = () => {
+      this.connected.backend = false;
       this.connected.indices = false;
       this.authenticated.indices = false;
-      this.onConnectionStatus?.({ type: 'indices', connected: false, status: 'closed' });
+      this.onConnectionStatus?.({ type: 'backend', connected: false, status: 'closed' });
     };
   }
 

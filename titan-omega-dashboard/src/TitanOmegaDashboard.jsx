@@ -3,7 +3,6 @@ import massiveService from './services/MassiveService';
 import { buildGEXProfile, buildWeeklyAnalysis } from './services/GEXCalculator';
 
 const STORAGE_KEY = 'titan_omega_session_v1';
-const API_KEY = import.meta.env.VITE_POLYGON_API_KEY || import.meta.env.VITE_MASSIVE_API_KEY;
 
 function formatETTime(date) {
   try {
@@ -68,6 +67,10 @@ export default function TitanOmegaDashboard() {
     massiveService.setCallbacks({
       onConnectionStatus: (s) => {
         if (cancelled) return;
+        if (s?.type === 'backend') {
+          setStatus({ mode: s?.connected ? 'BACKEND_OK' : 'BACKEND_DOWN' });
+          return;
+        }
         setStatus({ mode: s?.status === 'authenticated' ? 'WS_LIVE' : s?.status || 'WS' });
       },
       onError: (msg) => {
@@ -84,20 +87,21 @@ export default function TitanOmegaDashboard() {
 
     (async () => {
       setError(null);
-      if (!API_KEY) {
-        setStatus({ mode: 'NO_API_KEY' });
-        setError('Missing API key (set VITE_POLYGON_API_KEY)');
-        return;
-      }
-
       setStatus({ mode: 'CONNECTING' });
       const res = await massiveService.connectAll();
       if (cancelled) return;
       if (res?.errors?.length) setStatus({ mode: 'REST_OK' });
 
-      // lightweight weekly analysis needs daily bars; reuse REST daily via Polygon directly (optional)
-      // If you want full daily-bars fetch, wire it here.
-      setDailyBars((prev) => prev || []);
+      // Weekly analysis uses daily bars from backend proxy
+      try {
+        const dailyRes = await fetch('/api/daily?days=10');
+        const dailyJson = await dailyRes.json();
+        if (!dailyRes.ok || !dailyJson?.ok) throw new Error(dailyJson?.error || 'daily fetch failed');
+        setDailyBars(Array.isArray(dailyJson.bars) ? dailyJson.bars : []);
+      } catch (e) {
+        // Not fatal; dashboard still runs.
+        setDailyBars((prev) => prev || []);
+      }
     })();
 
     return () => {
@@ -164,13 +168,32 @@ export default function TitanOmegaDashboard() {
               Source: <span className="font-mono">{spx?.source || '—'}</span> / <span className="font-mono">{vix?.source || '—'}</span>
             </div>
             {error && <div className="mt-2 text-xs text-red-300">Error: {error}</div>}
-            {!API_KEY && <div className="mt-2 text-xs text-yellow-200">Set `VITE_POLYGON_API_KEY` to enable live streaming.</div>}
+            <div className="mt-2 text-xs text-gray-500">
+              Keys are stored server-side. Set <code className="font-mono">MASSIVE_API_KEY</code> in <code className="font-mono">titan-omega-dashboard/.env</code>.
+            </div>
           </div>
 
           {weekly?.available && (
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
               <div className="text-sm font-semibold text-gray-300 mb-2">Weekly Analysis</div>
-              <div className="text-xs text-gray-400">Loaded from daily bars (enable if you wire daily-bars fetch).</div>
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                  <div className="text-gray-500">Trend</div>
+                  <div className="font-mono font-bold">{weekly.weekSummary.trend}</div>
+                </div>
+                <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                  <div className="text-gray-500">Change</div>
+                  <div className="font-mono font-bold">{weekly.weekSummary.change}</div>
+                </div>
+                <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                  <div className="text-gray-500">Week High</div>
+                  <div className="font-mono font-bold">{Number(weekly.weekSummary.high).toFixed(0)}</div>
+                </div>
+                <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                  <div className="text-gray-500">Week Low</div>
+                  <div className="font-mono font-bold">{Number(weekly.weekSummary.low).toFixed(0)}</div>
+                </div>
+              </div>
             </div>
           )}
         </aside>
