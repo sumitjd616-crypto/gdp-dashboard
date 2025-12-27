@@ -1121,48 +1121,81 @@ function scoreMove15({ spot, bars, dealer }) {
   return {
     score,
     direction,
-    fire: score >= threshold,
+    headsUp: score >= 60,
+    trigger: score >= threshold,
     reasons,
   };
 }
 
 let lastAlertTs = 0;
+let lastHeadsUpTs = 0;
 function maybeEmitMoveAlert() {
   const spot = Number(latest.SPX?.price);
   const bars = latest.bars.SPX;
   const dealer = latest.dealer;
   const s = scoreMove15({ spot, bars, dealer });
-  if (!s?.fire) return;
   const now = Date.now();
-  if (now - lastAlertTs < 60_000) return; // 1/min max
-  lastAlertTs = now;
-  pushAlert({
-    type: 'MOVE_15PT',
-    ts: now,
-    spot,
-    direction: s.direction,
-    score: s.score,
-    reasons: s.reasons,
-    dealer: {
-      spx: {
-        netGEX: dealer.spx.blend.net?.gex,
-        gammaFlip: dealer.spx.blend.levels?.gammaFlip,
-        callWall: dealer.spx.blend.levels?.callWall,
-        putWall: dealer.spx.blend.levels?.putWall,
-        expirations: dealer.spx.expirations,
-      },
-      spy: dealer.spy?.blend?.available
-        ? {
-            netGEX: dealer.spy.blend.net?.gex,
-            gammaFlip: dealer.spy.blend.levels?.gammaFlip,
-            callWall: dealer.spy.blend.levels?.callWall,
-            putWall: dealer.spy.blend.levels?.putWall,
-            expirations: dealer.spy.expirations,
-          }
-        : null,
-      sync: dealer.sync || null,
-    },
-  });
+  if (!s) return;
+
+  const dealerPayload = {
+    spx: dealer.spx?.blend?.available
+      ? {
+          netGEX: dealer.spx.blend.net?.gex,
+          gammaFlip: dealer.spx.blend.levels?.gammaFlip,
+          callWall: dealer.spx.blend.levels?.callWall,
+          putWall: dealer.spx.blend.levels?.putWall,
+          expirations: dealer.spx.expirations,
+        }
+      : null,
+    spy: dealer.spy?.blend?.available
+      ? {
+          netGEX: dealer.spy.blend.net?.gex,
+          gammaFlip: dealer.spy.blend.levels?.gammaFlip,
+          callWall: dealer.spy.blend.levels?.callWall,
+          putWall: dealer.spy.blend.levels?.putWall,
+          expirations: dealer.spy.expirations,
+        }
+      : null,
+    sync: dealer.sync || null,
+    flow: dealer.flow || null,
+  };
+
+  // Tier 1: HEADS-UP (high recall, low spam)
+  if (s.headsUp && now - lastHeadsUpTs >= 20_000) {
+    lastHeadsUpTs = now;
+    pushAlert({
+      type: 'MOVE_15PT_HEADS_UP',
+      tier: 'HEADS_UP',
+      ts: now,
+      spot,
+      direction: s.direction,
+      score: s.score,
+      reasons: s.reasons,
+      dealer: dealerPayload,
+    });
+  }
+
+  // Tier 2: TRIGGER (high precision, confirmation required)
+  // Confirmation: (a) score threshold, (b) fresh options profile, (c) fresh SPX bar, (d) dealer agreement not terrible
+  const dealerFresh = dealer.spx?.blend?.timestamp ? now - Date.parse(dealer.spx.blend.timestamp) < 90_000 : false;
+  const barFresh = latest.status.lastSPXBarTs ? now - Number(latest.status.lastSPXBarTs) < 120_000 : false;
+  const agreement = Number(dealer.sync?.agreement || 0);
+  const okAgreement = !dealer.sync?.available || agreement >= 45;
+
+  if (s.trigger && dealerFresh && barFresh && okAgreement) {
+    if (now - lastAlertTs < 60_000) return; // 1/min max triggers
+    lastAlertTs = now;
+    pushAlert({
+      type: 'MOVE_15PT_TRIGGER',
+      tier: 'TRIGGER',
+      ts: now,
+      spot,
+      direction: s.direction,
+      score: s.score,
+      reasons: [...s.reasons, 'Trigger confirmations passed'],
+      dealer: dealerPayload,
+    });
+  }
 }
 
 server.listen(PORT, () => {

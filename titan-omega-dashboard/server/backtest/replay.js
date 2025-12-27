@@ -6,7 +6,7 @@ import readline from 'node:readline';
  * Replay backtester (real captured data only)
  *
  * Input: JSONL produced by server recorder (RECORD_PATH).
- * Evaluates MOVE_15PT alerts using subsequent SPX minute bars:
+ * Evaluates MOVE_15PT_HEADS_UP and MOVE_15PT_TRIGGER alerts using subsequent SPX minute bars:
  * - Target: +15 points in alert direction
  * - Stop:  -8 points (default) or can be tuned
  * - Horizon: 60 minutes
@@ -136,7 +136,7 @@ async function run() {
     if (!p?.type) continue;
 
     if (p.type === 'SPX_BAR' && p.data) spxBars.push(p.data);
-    if (p.type === 'ALERT' && p.data?.type === 'MOVE_15PT') alerts.push(p.data);
+    if (p.type === 'ALERT' && (p.data?.type === 'MOVE_15PT_TRIGGER' || p.data?.type === 'MOVE_15PT_HEADS_UP')) alerts.push(p.data);
   }
 
   // Sort bars by timestamp ascending for evaluation
@@ -145,6 +145,17 @@ async function run() {
   for (const b of spxBars) barsByTs.set(Number(b.timestamp), b);
 
   const results = alerts.map((a) => ({ alert: a, eval: evaluateAlert(a, barsByTs, opts) }));
+
+  // Lead-time analysis: pair each TRIGGER with the most recent HEADS_UP before it (within 10 minutes)
+  const byTs = [...alerts].sort((a, b) => Number(a.ts) - Number(b.ts));
+  const heads = byTs.filter((a) => a.type === 'MOVE_15PT_HEADS_UP');
+  const triggers = byTs.filter((a) => a.type === 'MOVE_15PT_TRIGGER');
+  const leadTimes = [];
+  for (const t of triggers) {
+    const tTs = Number(t.ts);
+    const prior = heads.filter((h) => Number(h.ts) < tTs && tTs - Number(h.ts) <= 10 * 60_000).pop();
+    if (prior) leadTimes.push((tTs - Number(prior.ts)) / 1000);
+  }
 
   const completed = results.filter((r) => r.eval.outcome === 'TARGET' || r.eval.outcome === 'STOP');
   const wins = completed.filter((r) => r.eval.outcome === 'TARGET');
@@ -170,6 +181,7 @@ async function run() {
         avgMfe: Number(avgMfe.toFixed(2)),
         avgMae: Number(avgMae.toFixed(2)),
         avgMinutesToWin: Number(avgTimeWin.toFixed(2)),
+        avgLeadSecondsHeadsUpToTrigger: leadTimes.length ? Number((leadTimes.reduce((a, b) => a + b, 0) / leadTimes.length).toFixed(2)) : null,
         grades: gradeCounts,
       },
       null,

@@ -339,7 +339,14 @@ export default function TitanOmegaDashboard() {
                 alerts.slice(0, 20).map((a, i) => (
                   <div key={i} className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
                     <div className="flex items-center justify-between">
-                      <div className="text-xs font-semibold text-gray-300">{a.type}</div>
+                      <div className="text-xs font-semibold text-gray-300">
+                        {a.type}{' '}
+                        {a.tier === 'TRIGGER' ? (
+                          <span className="ml-1 px-1.5 py-0.5 rounded bg-red-500/20 text-red-300 border border-red-500/30">TRIGGER</span>
+                        ) : a.tier === 'HEADS_UP' ? (
+                          <span className="ml-1 px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-300 border border-yellow-500/30">HEADS-UP</span>
+                        ) : null}
+                      </div>
                       <div className="text-xs text-gray-500">{a.ts ? formatETTime(new Date(a.ts)) : ''}</div>
                     </div>
                     <div className="text-xs text-gray-400 mt-1">
