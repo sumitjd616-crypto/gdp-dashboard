@@ -120,6 +120,13 @@ const latest = {
     lastVIXBarTs: null,
     counters: { msgs: 0, spx: 0, vix: 0, spxBars: 0, vixBars: 0 },
     countersStocks: { msgs: 0, spy: 0, spyBars: 0 },
+    options: {
+      connected: false,
+      authenticated: false,
+      lastMessageTs: null,
+      lastTradeTs: null,
+      counters: { msgs: 0, trades: 0 },
+    },
   },
   SPX: null,
   VIX: null,
@@ -183,6 +190,8 @@ const latest = {
       // These are *flows*, not OI, and are used to detect rapid positioning changes.
       spx: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
       spy: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
+      lastTradeTs: null,
+      computedAtTs: null,
       notes: [],
     },
   },
@@ -742,6 +751,8 @@ function recomputeFlow(windowSec = 30) {
     windowSec,
     spx: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
     spy: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
+    lastTradeTs: latest.status.options.lastTradeTs,
+    computedAtTs: Date.now(),
     notes: [],
   };
   for (const e of optionFlowEvents) {
@@ -765,9 +776,13 @@ function connectUpstreamOptions() {
   }
 
   upstreamOptionsAuthed = false;
+  latest.status.options.connected = false;
+  latest.status.options.authenticated = false;
+  latest.status.options.lastMessageTs = null;
   upstreamOptions = new WebSocket(WS_OPTIONS_URL);
 
   upstreamOptions.on('open', () => {
+    latest.status.options.connected = true;
     upstreamOptions.send(JSON.stringify({ action: 'auth', params: API_KEY }));
   });
 
@@ -776,9 +791,12 @@ function connectUpstreamOptions() {
     if (!messages) return;
     const list = Array.isArray(messages) ? messages : [messages];
     for (const msg of list) {
+      latest.status.options.lastMessageTs = Date.now();
+      latest.status.options.counters.msgs += 1;
       if (msg?.ev === 'status') {
         if (msg.status === 'auth_success') {
           upstreamOptionsAuthed = true;
+          latest.status.options.authenticated = true;
           // Subscribe to current set if we have one
           if (currentOptionSubs.size) {
             upstreamOptions.send(JSON.stringify({ action: 'subscribe', params: Array.from(currentOptionSubs).join(',') }));
@@ -792,6 +810,7 @@ function connectUpstreamOptions() {
 
       // Options trade events: Polygon uses ev:'T' with msg.sym as option ticker (e.g. "O:SPY...")
       if (msg?.ev === 'T' && msg.sym && String(msg.sym).startsWith('O:')) {
+        latest.status.options.counters.trades += 1;
         const ticker = String(msg.sym);
         const g = optionGreeksByTicker.get(ticker);
         if (!g) continue; // only track what we have greeks for (real)
@@ -799,6 +818,7 @@ function connectUpstreamOptions() {
         const size = Number(msg.s || 0);
         const ts = Number(msg.t || Date.now());
         if (!size) continue;
+        latest.status.options.lastTradeTs = ts;
 
         const under = g.underlying;
         const spot = under === 'SPX' ? Number(latest.SPX?.price) : under === 'SPY' ? Number(latest.SPY?.price) : null;
@@ -1458,5 +1478,11 @@ server.listen(PORT, () => {
 
   // 1Hz dashboard state stream (real inputs, no extra API calls)
   setInterval(broadcastState, CFG.stateBroadcastMs);
+
+  // 1Hz flow recompute even if no trades (keeps freshness honest)
+  setInterval(() => {
+    latest.dealer.flow.windowSec = CFG.flowWindowSec;
+    recomputeFlow(CFG.flowWindowSec);
+  }, 1000);
 });
 
