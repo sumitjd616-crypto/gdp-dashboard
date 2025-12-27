@@ -40,8 +40,11 @@ export default function TitanOmegaDashboard() {
 
   const [spx, setSpx] = useState(null);
   const [vix, setVix] = useState(null);
+  const [spy, setSpy] = useState(null);
   const [dailyBars, setDailyBars] = useState([]);
   const [spxBars, setSpxBars] = useState([]);
+  const [alerts, setAlerts] = useState([]);
+  const [dealer, setDealer] = useState(null);
   const [dataStatus, setDataStatus] = useState({
     ws: { connected: false, authenticated: false, error: null },
     lastSPXTs: null,
@@ -91,7 +94,10 @@ export default function TitanOmegaDashboard() {
         const data = massiveService.getData();
         if (data?.SPX) setSpx(data.SPX);
         if (data?.VIX) setVix(data.VIX);
+        if (data?.SPY) setSpy(data.SPY);
         if (data?.bars?.SPX && Array.isArray(data.bars.SPX)) setSpxBars(data.bars.SPX);
+        if (Array.isArray(data?.alerts)) setAlerts(data.alerts);
+        if (data?.dealer) setDealer(data.dealer);
       },
     });
 
@@ -120,6 +126,7 @@ export default function TitanOmegaDashboard() {
 
   const spot = spx?.price ? Number(spx.price) : null;
   const vixVal = vix?.value ? Number(vix.value) : null;
+  const spyPx = spy?.price ? Number(spy.price) : null;
 
   const gex = useMemo(() => {
     if (!spot || !spxBars.length) return null;
@@ -190,6 +197,11 @@ export default function TitanOmegaDashboard() {
               <div className="text-xl font-mono">{vixVal ? vixVal.toFixed(2) : '—'}</div>
               <div className="text-xs text-gray-600">{vix?.timestamp ? formatETTime(new Date(vix.timestamp)) : ''} ET</div>
             </div>
+            <div className="text-center">
+              <div className="text-xs text-gray-500">SPY</div>
+              <div className="text-xl font-mono">{spyPx ? spyPx.toFixed(2) : '—'}</div>
+              <div className="text-xs text-gray-600">{spy?.timestamp ? formatETTime(new Date(spy.timestamp)) : ''} ET</div>
+            </div>
             {gex && (
               <div className="flex items-center gap-2">
                 <Badge color="yellow">γ-Flip {gex.gammaFlip}</Badge>
@@ -244,6 +256,62 @@ export default function TitanOmegaDashboard() {
                 <div className="text-gray-500">SPX bars cached</div>
                 <div className="font-mono font-bold">{spxBars.length}</div>
               </div>
+            </div>
+          </div>
+
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-sm font-semibold text-gray-300">Dealer positioning (real options)</div>
+              <Badge color={dealer?.available ? 'green' : 'yellow'}>{dealer?.available ? 'LIVE' : 'UNAVAILABLE'}</Badge>
+            </div>
+            {!dealer?.available && <div className="text-xs text-gray-400">{dealer?.reason || 'Waiting for first options snapshot…'}</div>}
+            {dealer?.available && (
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                  <div className="text-gray-500">Net GEX</div>
+                  <div className="font-mono font-bold">{Number(dealer.net?.gex || 0).toFixed(0)}</div>
+                </div>
+                <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                  <div className="text-gray-500">Net Vanna</div>
+                  <div className="font-mono font-bold">{Number(dealer.net?.vanna || 0).toFixed(0)}</div>
+                </div>
+                <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                  <div className="text-gray-500">Net Charm</div>
+                  <div className="font-mono font-bold">{Number(dealer.net?.charm || 0).toFixed(0)}</div>
+                </div>
+                <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                  <div className="text-gray-500">Expiry</div>
+                  <div className="font-mono font-bold">{dealer.expiration || '—'}</div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-sm font-semibold text-gray-300">Alerts</div>
+              <Badge color={alerts.length ? 'yellow' : 'gray'}>{alerts.length ? `${alerts.length}` : '0'}</Badge>
+            </div>
+            <div className="space-y-2 max-h-64 overflow-y-auto">
+              {alerts.length === 0 ? (
+                <div className="text-xs text-gray-500">No alerts yet.</div>
+              ) : (
+                alerts.slice(0, 20).map((a, i) => (
+                  <div key={i} className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                    <div className="flex items-center justify-between">
+                      <div className="text-xs font-semibold text-gray-300">{a.type}</div>
+                      <div className="text-xs text-gray-500">{a.ts ? formatETTime(new Date(a.ts)) : ''}</div>
+                    </div>
+                    <div className="text-xs text-gray-400 mt-1">
+                      Dir: <span className="font-mono">{a.direction}</span> · Score: <span className="font-mono">{a.score}</span> · Spot:{' '}
+                      <span className="font-mono">{a.spot?.toFixed ? a.spot.toFixed(2) : a.spot}</span>
+                    </div>
+                    {Array.isArray(a.reasons) && a.reasons.length > 0 && (
+                      <div className="text-xs text-gray-500 mt-1">{a.reasons.slice(0, 2).join(' · ')}</div>
+                    )}
+                  </div>
+                ))
+              )}
             </div>
           </div>
 

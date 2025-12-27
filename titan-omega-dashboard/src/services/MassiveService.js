@@ -27,7 +27,10 @@ class MassiveService {
     this.data = {
       SPX: null,
       VIX: null,
-      bars: { SPX: [] },
+      SPY: null,
+      bars: { SPX: [], VIX: [], SPY: [] },
+      dealer: null,
+      alerts: [],
     };
 
     this.onDataUpdate = null;
@@ -143,6 +146,19 @@ class MassiveService {
       };
     }
 
+    const spy = json?.spy;
+    if (spy?.c != null) {
+      this.data.SPY = {
+        price: spy.c,
+        open: spy.o,
+        high: spy.h,
+        low: spy.l,
+        volume: spy.v,
+        timestamp: new Date(spy.t),
+        source: 'REST_PREV_DAY_PROXY',
+      };
+    }
+
     this.saveSession();
     return this.data;
   }
@@ -184,7 +200,12 @@ class MassiveService {
         const snap = messages.data || {};
         if (snap.SPX) this.data.SPX = snap.SPX;
         if (snap.VIX) this.data.VIX = snap.VIX;
+        if (snap.SPY) this.data.SPY = snap.SPY;
         if (snap.bars?.SPX && Array.isArray(snap.bars.SPX)) this.data.bars.SPX = snap.bars.SPX;
+        if (snap.bars?.VIX && Array.isArray(snap.bars.VIX)) this.data.bars.VIX = snap.bars.VIX;
+        if (snap.bars?.SPY && Array.isArray(snap.bars.SPY)) this.data.bars.SPY = snap.bars.SPY;
+        if (snap.dealer) this.data.dealer = snap.dealer;
+        if (Array.isArray(snap.alerts)) this.data.alerts = snap.alerts;
         if (snap.status) {
           this.connected.indices = Boolean(snap.status.connected);
           this.authenticated.indices = Boolean(snap.status.authenticated);
@@ -232,13 +253,46 @@ class MassiveService {
       if (messages.type === 'VIX_BAR') {
         const bar = messages.data;
         if (bar) {
-          if (!this.data.bars.VIX) this.data.bars.VIX = [];
           this.data.bars.VIX.unshift(bar);
           if (this.data.bars.VIX.length > 500) this.data.bars.VIX.pop();
           if (bar.close != null) this.data.VIX = { value: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
           this.saveSession();
           this.onDataUpdate?.('bar', 'VIX', bar);
         }
+        return;
+      }
+
+      if (messages.type === 'SPY') {
+        this.data.SPY = { ...messages.data, source: messages.data?.source || 'WS_PROXY' };
+        this.saveSession();
+        this.onDataUpdate?.('index', 'SPY', this.data);
+        return;
+      }
+
+      if (messages.type === 'SPY_BAR') {
+        const bar = messages.data;
+        if (bar) {
+          this.data.bars.SPY.unshift(bar);
+          if (this.data.bars.SPY.length > 500) this.data.bars.SPY.pop();
+          if (bar.close != null) this.data.SPY = { price: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
+          this.saveSession();
+          this.onDataUpdate?.('bar', 'SPY', bar);
+        }
+        return;
+      }
+
+      if (messages.type === 'DEALER_PROFILE') {
+        this.data.dealer = messages.data;
+        this.saveSession();
+        this.onDataUpdate?.('dealer', 'PROFILE', this.data);
+        return;
+      }
+
+      if (messages.type === 'ALERT') {
+        this.data.alerts.unshift(messages.data);
+        if (this.data.alerts.length > 200) this.data.alerts.pop();
+        this.saveSession();
+        this.onDataUpdate?.('alert', messages.data?.type || 'ALERT', messages.data);
       }
     };
 
