@@ -26,12 +26,37 @@ import path from 'node:path';
 
 const PORT = Number(process.env.PORT || 8787);
 const PROXY_TOKEN = process.env.PROXY_TOKEN || '';
-const API_KEY =
-  process.env.MASSIVE_API_KEY ||
-  process.env.POLYGON_API_KEY ||
-  process.env.VITE_POLYGON_API_KEY ||
-  process.env.VITE_MASSIVE_API_KEY ||
-  '';
+
+function parseKeyRing() {
+  const raw =
+    process.env.MASSIVE_API_KEYS ||
+    process.env.POLYGON_API_KEYS ||
+    process.env.MASSIVE_API_KEY ||
+    process.env.POLYGON_API_KEY ||
+    process.env.VITE_POLYGON_API_KEY ||
+    process.env.VITE_MASSIVE_API_KEY ||
+    '';
+  const keys = String(raw)
+    .split(/[\n,\s]+/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return Array.from(new Set(keys));
+}
+
+function maskKey(k) {
+  const s = String(k || '');
+  if (!s) return null;
+  const last4 = s.slice(-4);
+  return `****${last4}`;
+}
+
+const KEY_RING = parseKeyRing();
+let ACTIVE_KEY = null;
+let ACTIVE_KEY_META = { ok: false, checkedAt: null, keyLast4: null, capabilities: {} };
+
+function getApiKey() {
+  return ACTIVE_KEY;
+}
 
 const WS_INDICES_URL = process.env.MASSIVE_WS_INDICES_URL || 'wss://socket.polygon.io/indices';
 const WS_STOCKS_URL = process.env.MASSIVE_WS_STOCKS_URL || 'wss://socket.polygon.io/stocks';
@@ -461,6 +486,47 @@ async function fetchJson(url) {
   return data;
 }
 
+async function probeKeyOnce(key) {
+  // Never log or return raw keys. Probe capabilities via REST.
+  const caps = {
+    indicesPrev: false,
+    optionsSpySnapshot: false,
+  };
+  try {
+    await fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/I:SPX/prev?apiKey=${encodeURIComponent(key)}`);
+    caps.indicesPrev = true;
+  } catch {
+    caps.indicesPrev = false;
+  }
+  try {
+    await fetchJson(`${REST_BASE_URL}/v3/snapshot/options/SPY?limit=1&apiKey=${encodeURIComponent(key)}`);
+    caps.optionsSpySnapshot = true;
+  } catch {
+    caps.optionsSpySnapshot = false;
+  }
+  const ok = Boolean(caps.indicesPrev && caps.optionsSpySnapshot);
+  return { ok, caps };
+}
+
+async function selectWorkingKey() {
+  if (!KEY_RING.length) {
+    ACTIVE_KEY = null;
+    ACTIVE_KEY_META = { ok: false, checkedAt: new Date().toISOString(), keyLast4: null, capabilities: {} };
+    return ACTIVE_KEY_META;
+  }
+  for (const k of KEY_RING) {
+    const res = await probeKeyOnce(k);
+    if (res.ok) {
+      ACTIVE_KEY = k;
+      ACTIVE_KEY_META = { ok: true, checkedAt: new Date().toISOString(), keyLast4: maskKey(k), capabilities: res.caps };
+      return ACTIVE_KEY_META;
+    }
+  }
+  ACTIVE_KEY = null;
+  ACTIVE_KEY_META = { ok: false, checkedAt: new Date().toISOString(), keyLast4: maskKey(KEY_RING[0]), capabilities: {} };
+  return ACTIVE_KEY_META;
+}
+
 function requireToken(req, res) {
   if (!PROXY_TOKEN) return true;
   const tok = req.headers['x-titan-token'];
@@ -473,12 +539,31 @@ app.get('/health', (_req, res) => {
   if (!requireToken(_req, res)) return;
   res.json({
     ok: true,
-    hasKey: Boolean(API_KEY),
+    hasKey: Boolean(getApiKey()),
+    keyRingCount: KEY_RING.length,
+    activeKey: ACTIVE_KEY_META?.keyLast4 || null,
+    activeKeyOk: Boolean(ACTIVE_KEY_META?.ok),
+    activeKeyCheckedAt: ACTIVE_KEY_META?.checkedAt || null,
     tokenProtected: Boolean(PROXY_TOKEN),
     wsUrl: WS_INDICES_URL,
     connected: latest.status.connected,
     authenticated: latest.status.authenticated,
   });
+});
+
+app.get('/api/keys/check', async (req, res) => {
+  if (!requireToken(req, res)) return;
+  if (!KEY_RING.length) return res.json({ ok: true, keys: [] });
+  const keys = [];
+  for (const k of KEY_RING) {
+    const r = await probeKeyOnce(k);
+    keys.push({
+      key: maskKey(k),
+      ok: r.ok,
+      capabilities: r.caps,
+    });
+  }
+  res.json({ ok: true, keys });
 });
 
 app.get('/api/status', (req, res) => {
@@ -498,13 +583,13 @@ app.get('/api/options/flow', (req, res) => {
 
 app.get('/api/prev', async (_req, res) => {
   if (!requireToken(_req, res)) return;
-  if (!API_KEY) return res.status(400).json({ ok: false, error: 'Missing server API key (set MASSIVE_API_KEY)' });
+  if (!getApiKey()) return res.status(400).json({ ok: false, error: 'Missing server API key (set MASSIVE_API_KEYS or MASSIVE_API_KEY)' });
   try {
     const [spx, vix, spy, qqq] = await Promise.all([
-      fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/I:SPX/prev?apiKey=${encodeURIComponent(API_KEY)}`),
-      fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/I:VIX/prev?apiKey=${encodeURIComponent(API_KEY)}`),
-      fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/SPY/prev?apiKey=${encodeURIComponent(API_KEY)}`),
-      fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/QQQ/prev?apiKey=${encodeURIComponent(API_KEY)}`),
+      fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/I:SPX/prev?apiKey=${encodeURIComponent(getApiKey())}`),
+      fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/I:VIX/prev?apiKey=${encodeURIComponent(getApiKey())}`),
+      fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/SPY/prev?apiKey=${encodeURIComponent(getApiKey())}`),
+      fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/QQQ/prev?apiKey=${encodeURIComponent(getApiKey())}`),
     ]);
     res.json({
       ok: true,
@@ -520,13 +605,13 @@ app.get('/api/prev', async (_req, res) => {
 
 app.get('/api/daily', async (req, res) => {
   if (!requireToken(req, res)) return;
-  if (!API_KEY) return res.status(400).json({ ok: false, error: 'Missing server API key (set MASSIVE_API_KEY)' });
+  if (!getApiKey()) return res.status(400).json({ ok: false, error: 'Missing server API key (set MASSIVE_API_KEYS or MASSIVE_API_KEY)' });
   const days = Math.max(5, Math.min(90, Number(req.query.days || 10)));
   const to = new Date().toISOString().slice(0, 10);
   const from = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   try {
     const data = await fetchJson(
-      `${REST_BASE_URL}/v2/aggs/ticker/I:SPX/range/1/day/${from}/${to}?adjusted=true&sort=desc&limit=${days}&apiKey=${encodeURIComponent(API_KEY)}`
+      `${REST_BASE_URL}/v2/aggs/ticker/I:SPX/range/1/day/${from}/${to}?adjusted=true&sort=desc&limit=${days}&apiKey=${encodeURIComponent(getApiKey())}`
     );
     const bars = Array.isArray(data?.results)
       ? data.results.map((b) => ({
@@ -572,7 +657,7 @@ let reconnectTimerStocks = null;
 let reconnectTimerOptions = null;
 
 function connectUpstream() {
-  if (!API_KEY) {
+  if (!getApiKey()) {
     latest.status = { connected: false, authenticated: false, error: 'missing_key' };
     return;
   }
@@ -598,7 +683,7 @@ function connectUpstream() {
     latest.status.authenticated = false;
     latest.status.error = undefined;
     wsBroadcast(wss, { type: 'status', status: latest.status });
-    upstreamIndices.send(JSON.stringify({ action: 'auth', params: API_KEY }));
+    upstreamIndices.send(JSON.stringify({ action: 'auth', params: getApiKey() }));
   });
 
   upstreamIndices.on('message', (buf) => {
@@ -708,7 +793,7 @@ function scheduleReconnect() {
 }
 
 function connectUpstreamStocks() {
-  if (!API_KEY) return;
+  if (!getApiKey()) return;
   if (upstreamStocks) {
     try {
       upstreamStocks.close();
@@ -721,7 +806,7 @@ function connectUpstreamStocks() {
   upstreamStocks = new WebSocket(WS_STOCKS_URL);
 
   upstreamStocks.on('open', () => {
-    upstreamStocks.send(JSON.stringify({ action: 'auth', params: API_KEY }));
+    upstreamStocks.send(JSON.stringify({ action: 'auth', params: getApiKey() }));
   });
 
   upstreamStocks.on('message', (buf) => {
@@ -948,7 +1033,7 @@ function recomputeQuotes(windowSec = 15) {
 }
 
 function connectUpstreamOptions() {
-  if (!API_KEY) return;
+  if (!getApiKey()) return;
   if (upstreamOptions) {
     try {
       upstreamOptions.close();
@@ -965,7 +1050,7 @@ function connectUpstreamOptions() {
 
   upstreamOptions.on('open', () => {
     latest.status.options.connected = true;
-    upstreamOptions.send(JSON.stringify({ action: 'auth', params: API_KEY }));
+    upstreamOptions.send(JSON.stringify({ action: 'auth', params: getApiKey() }));
   });
 
   upstreamOptions.on('message', (buf) => {
@@ -1123,12 +1208,12 @@ function pickExpiryBlend(contracts) {
 async function fetchOptionsSnapshot(underlying) {
   // Uses snapshot endpoint; follows next_url a few times (real data only).
   const out = [];
-  let url = `${REST_BASE_URL}/v3/snapshot/options/${encodeURIComponent(underlying)}?limit=250&apiKey=${encodeURIComponent(API_KEY)}`;
+  let url = `${REST_BASE_URL}/v3/snapshot/options/${encodeURIComponent(underlying)}?limit=250&apiKey=${encodeURIComponent(getApiKey())}`;
   for (let i = 0; i < 5; i += 1) {
     const json = await fetchJson(url);
     if (Array.isArray(json?.results)) out.push(...json.results);
     if (!json?.next_url) break;
-    url = `${json.next_url}${json.next_url.includes('?') ? '&' : '?'}apiKey=${encodeURIComponent(API_KEY)}`;
+    url = `${json.next_url}${json.next_url.includes('?') ? '&' : '?'}apiKey=${encodeURIComponent(getApiKey())}`;
   }
   return out;
 }
@@ -1409,7 +1494,7 @@ function computeSync3() {
 }
 
 async function pollDealerProfile() {
-  if (!API_KEY) return;
+  if (!getApiKey()) return;
   try {
     // keep flow window aligned to config (seconds-level)
     latest.dealer.flow.windowSec = CFG.flowWindowSec;
@@ -1820,9 +1905,12 @@ server.listen(PORT, () => {
   // Intentionally do NOT log keys.
   // eslint-disable-next-line no-console
   console.log(`Titan Omega backend listening on :${PORT}`);
-  connectUpstream();
-  connectUpstreamStocks();
-  connectUpstreamOptions();
+  (async () => {
+    await selectWorkingKey();
+    connectUpstream();
+    connectUpstreamStocks();
+    connectUpstreamOptions();
+  })();
 
   // Options + alerts loops (real data only)
   pollDealerProfile();
