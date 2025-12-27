@@ -958,7 +958,16 @@ function computeDealerProfile({ spot, vix, contracts, expiration, underlying }) 
     netCharm += sign * charm;
 
     if (!perStrike.has(strike)) {
-      perStrike.set(strike, { strike, netGEX: 0, callGEX: 0, putGEX: 0, callOI: 0, putOI: 0 });
+      perStrike.set(strike, {
+        strike,
+        netGEX: 0,
+        callGEX: 0,
+        putGEX: 0,
+        callOI: 0,
+        putOI: 0,
+        netVEX: 0, // vanna exposure proxy (real)
+        netCharm: 0, // charm exposure proxy (real)
+      });
     }
     const s = perStrike.get(strike);
     if (type === 'call') {
@@ -969,6 +978,8 @@ function computeDealerProfile({ spot, vix, contracts, expiration, underlying }) 
       s.putOI += oi;
     }
     s.netGEX = s.callGEX + s.putGEX;
+    s.netVEX += sign * vanna;
+    s.netCharm += sign * charm;
   }
 
   const strikes = Array.from(perStrike.values()).sort((a, b) => a.strike - b.strike);
@@ -1018,13 +1029,25 @@ function blendProfiles(p0, pw, weights = { d0: 0.65, weekly: 0.35 }) {
   const perStrike = new Map();
   const add = (p, w) => {
     for (const s of p.perStrike || []) {
-      if (!perStrike.has(s.strike)) perStrike.set(s.strike, { strike: s.strike, netGEX: 0, callGEX: 0, putGEX: 0, callOI: 0, putOI: 0 });
+      if (!perStrike.has(s.strike))
+        perStrike.set(s.strike, {
+          strike: s.strike,
+          netGEX: 0,
+          callGEX: 0,
+          putGEX: 0,
+          callOI: 0,
+          putOI: 0,
+          netVEX: 0,
+          netCharm: 0,
+        });
       const t = perStrike.get(s.strike);
       t.netGEX += (s.netGEX || 0) * w;
       t.callGEX += (s.callGEX || 0) * w;
       t.putGEX += (s.putGEX || 0) * w;
       t.callOI += (s.callOI || 0) * w;
       t.putOI += (s.putOI || 0) * w;
+      t.netVEX += (s.netVEX || 0) * w;
+      t.netCharm += (s.netCharm || 0) * w;
     }
   };
 
