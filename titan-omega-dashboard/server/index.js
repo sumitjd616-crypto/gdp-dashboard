@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import http from 'node:http';
 import express from 'express';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -51,6 +52,7 @@ function maskKey(k) {
 }
 
 const KEY_RING = parseKeyRing();
+const BAD_KEYS = new Set();
 let ACTIVE_KEY = null;
 let ACTIVE_KEY_META = { ok: false, checkedAt: null, keyLast4: null, capabilities: {} };
 
@@ -515,6 +517,7 @@ async function selectWorkingKey() {
     return ACTIVE_KEY_META;
   }
   for (const k of KEY_RING) {
+    if (BAD_KEYS.has(k)) continue;
     const res = await probeKeyOnce(k);
     if (res.ok) {
       ACTIVE_KEY = k;
@@ -525,6 +528,18 @@ async function selectWorkingKey() {
   ACTIVE_KEY = null;
   ACTIVE_KEY_META = { ok: false, checkedAt: new Date().toISOString(), keyLast4: maskKey(KEY_RING[0]), capabilities: {} };
   return ACTIVE_KEY_META;
+}
+
+function markActiveKeyBad(reason = 'unknown') {
+  if (!ACTIVE_KEY) return;
+  BAD_KEYS.add(ACTIVE_KEY);
+  ACTIVE_KEY_META = {
+    ...ACTIVE_KEY_META,
+    ok: false,
+    checkedAt: new Date().toISOString(),
+    capabilities: { ...(ACTIVE_KEY_META.capabilities || {}), wsAuthFailed: true, reason },
+  };
+  ACTIVE_KEY = null;
 }
 
 function requireToken(req, res) {
@@ -658,7 +673,12 @@ let reconnectTimerOptions = null;
 
 function connectUpstream() {
   if (!getApiKey()) {
-    latest.status = { connected: false, authenticated: false, error: 'missing_key' };
+    selectWorkingKey().then(() => {
+      if (getApiKey()) connectUpstream();
+    });
+    latest.status.connected = false;
+    latest.status.authenticated = false;
+    latest.status.error = 'missing_key';
     return;
   }
 
@@ -707,6 +727,8 @@ function connectUpstream() {
           latest.status.authenticated = false;
           latest.status.error = msg.message || 'auth_failed';
           wsBroadcast(wss, { type: 'status', status: latest.status });
+          markActiveKeyBad('indices_ws_auth_failed');
+          selectWorkingKey().then(() => connectUpstream());
         }
         continue;
       }
@@ -819,6 +841,9 @@ function connectUpstreamStocks() {
         if (msg.status === 'auth_success') {
           upstreamStocksAuthed = true;
           upstreamStocks.send(JSON.stringify({ action: 'subscribe', params: 'T.SPY,AM.SPY,T.QQQ,AM.QQQ' }));
+        } else if (msg.status === 'auth_failed') {
+          markActiveKeyBad('stocks_ws_auth_failed');
+          selectWorkingKey().then(() => connectUpstreamStocks());
         }
         continue;
       }
@@ -1070,6 +1095,9 @@ function connectUpstreamOptions() {
           }
           recomputeFlow(latest.dealer.flow.windowSec || 30);
           wsBroadcast(wss, { type: 'DEALER_FLOW', data: latest.dealer.flow });
+        } else if (msg.status === 'auth_failed') {
+          markActiveKeyBad('options_ws_auth_failed');
+          selectWorkingKey().then(() => connectUpstreamOptions());
         }
         continue;
       }
@@ -1494,7 +1522,10 @@ function computeSync3() {
 }
 
 async function pollDealerProfile() {
-  if (!getApiKey()) return;
+  if (!getApiKey()) {
+    await selectWorkingKey();
+    if (!getApiKey()) return;
+  }
   try {
     // keep flow window aligned to config (seconds-level)
     latest.dealer.flow.windowSec = CFG.flowWindowSec;
