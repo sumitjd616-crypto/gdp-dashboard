@@ -1,6 +1,8 @@
 import http from 'node:http';
 import express from 'express';
 import { WebSocket, WebSocketServer } from 'ws';
+import fs from 'node:fs';
+import path from 'node:path';
 
 /**
  * Titan Omega backend proxy
@@ -35,6 +37,9 @@ const WS_INDICES_URL = process.env.MASSIVE_WS_INDICES_URL || 'wss://socket.polyg
 const WS_STOCKS_URL = process.env.MASSIVE_WS_STOCKS_URL || 'wss://socket.polygon.io/stocks';
 const REST_BASE_URL = 'https://api.polygon.io';
 
+// Optional recorder (real data only, no secrets)
+const RECORD_PATH = process.env.RECORD_PATH || '';
+
 const app = express();
 const server = http.createServer(app);
 
@@ -65,7 +70,7 @@ const latest = {
       reason: 'not_loaded',
       timestamp: null,
       underlying: 'SPX',
-      expiration: null,
+      expirations: { d0: null, weekly: null },
       contracts: 0,
       spot: null,
       vix: null,
@@ -73,13 +78,16 @@ const latest = {
       levels: { gammaFlip: null, callWall: null, putWall: null },
       perStrike: [],
       changes: null,
+      d0: null,
+      weekly: null,
+      blend: null,
     },
     spy: {
       available: false,
       reason: 'not_loaded',
       timestamp: null,
       underlying: 'SPY',
-      expiration: null,
+      expirations: { d0: null, weekly: null },
       contracts: 0,
       spot: null,
       vix: null,
@@ -87,6 +95,9 @@ const latest = {
       levels: { gammaFlip: null, callWall: null, putWall: null },
       perStrike: [],
       changes: null,
+      d0: null,
+      weekly: null,
+      blend: null,
     },
     sync: {
       available: false,
@@ -103,6 +114,16 @@ const latest = {
   alerts: [], // newest-first
 };
 
+function recordEvent(type, payload) {
+  if (!RECORD_PATH) return;
+  try {
+    const line = JSON.stringify({ ts: Date.now(), type, payload });
+    fs.appendFileSync(RECORD_PATH, `${line}\n`);
+  } catch {
+    // ignore recorder failures
+  }
+}
+
 function safeJsonParse(s) {
   try {
     return JSON.parse(s);
@@ -118,6 +139,8 @@ function wsBroadcast(wss, payload) {
       client.send(msg);
     }
   }
+  // Record broadcast payload (no secrets)
+  recordEvent('broadcast', payload);
 }
 
 async function fetchJson(url) {
@@ -481,6 +504,21 @@ function pickNearestExpiry(contracts) {
   return exps[0] || null;
 }
 
+function pickExpiryBlend(contracts) {
+  const today = new Date().toISOString().slice(0, 10);
+  const expirations = Array.from(
+    new Set(
+      contracts
+        .map((c) => c?.details?.expiration_date)
+        .filter((d) => typeof d === 'string' && d >= today)
+    )
+  ).sort();
+
+  const d0 = expirations.includes(today) ? today : null;
+  const weekly = expirations.find((d) => d > today) || null;
+  return { d0, weekly };
+}
+
 async function fetchOptionsSnapshot(underlying) {
   // Uses snapshot endpoint; follows next_url a few times (real data only).
   const out = [];
@@ -577,6 +615,67 @@ function computeDealerProfile({ spot, vix, contracts, expiration, underlying }) 
   };
 }
 
+function blendProfiles(p0, pw, weights = { d0: 0.65, weekly: 0.35 }) {
+  const has0 = p0?.available;
+  const hasW = pw?.available;
+  if (!has0 && !hasW) return { available: false, reason: 'no_profiles' };
+
+  const w0 = has0 && hasW ? weights.d0 : has0 ? 1 : 0;
+  const wW = has0 && hasW ? weights.weekly : hasW ? 1 : 0;
+
+  const perStrike = new Map();
+  const add = (p, w) => {
+    for (const s of p.perStrike || []) {
+      if (!perStrike.has(s.strike)) perStrike.set(s.strike, { strike: s.strike, netGEX: 0, callGEX: 0, putGEX: 0, callOI: 0, putOI: 0 });
+      const t = perStrike.get(s.strike);
+      t.netGEX += (s.netGEX || 0) * w;
+      t.callGEX += (s.callGEX || 0) * w;
+      t.putGEX += (s.putGEX || 0) * w;
+      t.callOI += (s.callOI || 0) * w;
+      t.putOI += (s.putOI || 0) * w;
+    }
+  };
+
+  if (has0) add(p0, w0);
+  if (hasW) add(pw, wW);
+
+  const strikes = Array.from(perStrike.values()).sort((a, b) => a.strike - b.strike);
+  let gammaFlip = null;
+  for (let i = 1; i < strikes.length; i += 1) {
+    if (strikes[i - 1].netGEX === 0) {
+      gammaFlip = strikes[i - 1].strike;
+      break;
+    }
+    if (strikes[i - 1].netGEX * strikes[i].netGEX < 0) {
+      gammaFlip = strikes[i].strike;
+      break;
+    }
+  }
+  const spot = (has0 ? p0.spot : pw.spot) ?? null;
+  const above = strikes.filter((s) => spot != null && s.strike >= spot).sort((a, b) => a.netGEX - b.netGEX);
+  const below = strikes.filter((s) => spot != null && s.strike <= spot).sort((a, b) => b.netGEX - a.netGEX);
+  const callWall = above[0]?.strike ?? null;
+  const putWall = below[0]?.strike ?? null;
+
+  const net = {
+    gex: (has0 ? p0.net.gex * w0 : 0) + (hasW ? pw.net.gex * wW : 0),
+    vanna: (has0 ? p0.net.vanna * w0 : 0) + (hasW ? pw.net.vanna * wW : 0),
+    charm: (has0 ? p0.net.charm * w0 : 0) + (hasW ? pw.net.charm * wW : 0),
+  };
+
+  return {
+    available: true,
+    timestamp: new Date().toISOString(),
+    underlying: has0 ? p0.underlying : pw.underlying,
+    spot,
+    expiration: { d0: has0 ? p0.expiration : null, weekly: hasW ? pw.expiration : null },
+    net,
+    levels: { gammaFlip, callWall, putWall },
+    perStrike: strikes,
+    weights: { d0: w0, weekly: wW },
+  };
+}
+
 let lastDealerSPX = null;
 let lastDealerSPY = null;
 
@@ -658,19 +757,36 @@ async function pollDealerProfile() {
     } else if (!spxContracts.length) {
       latest.dealer.spx = { ...latest.dealer.spx, available: false, reason: 'no_spx_contracts', timestamp: new Date().toISOString() };
     } else {
-      const exp = pickNearestExpiry(spxContracts);
-      const prof = computeDealerProfile({ spot: spxSpot, vix, contracts: spxContracts, expiration: exp, underlying: 'SPX' });
-      if (lastDealerSPX?.available) {
-        prof.changes = {
-          netGEX: prof.net.gex - lastDealerSPX.net.gex,
-          netVanna: prof.net.vanna - lastDealerSPX.net.vanna,
-          netCharm: prof.net.charm - lastDealerSPX.net.charm,
-          gammaFlip: (prof.levels.gammaFlip ?? 0) - (lastDealerSPX.levels.gammaFlip ?? 0),
+      const exps = pickExpiryBlend(spxContracts);
+      const d0 = exps.d0 ? computeDealerProfile({ spot: spxSpot, vix, contracts: spxContracts, expiration: exps.d0, underlying: 'SPX' }) : null;
+      const wk = exps.weekly ? computeDealerProfile({ spot: spxSpot, vix, contracts: spxContracts, expiration: exps.weekly, underlying: 'SPX' }) : null;
+      const blend = blendProfiles(d0, wk);
+
+      const composite = {
+        available: Boolean(blend?.available),
+        reason: blend?.available ? null : blend?.reason || 'unavailable',
+        timestamp: new Date().toISOString(),
+        underlying: 'SPX',
+        spot: spxSpot,
+        vix,
+        expirations: exps,
+        d0,
+        weekly: wk,
+        blend,
+      };
+
+      if (lastDealerSPX?.blend?.available && composite.blend?.available) {
+        composite.changes = {
+          netGEX: composite.blend.net.gex - lastDealerSPX.blend.net.gex,
+          netVanna: composite.blend.net.vanna - lastDealerSPX.blend.net.vanna,
+          netCharm: composite.blend.net.charm - lastDealerSPX.blend.net.charm,
+          gammaFlip: (composite.blend.levels.gammaFlip ?? 0) - (lastDealerSPX.blend.levels.gammaFlip ?? 0),
         };
       }
-      lastDealerSPX = prof;
-      latest.dealer.spx = prof;
-      wsBroadcast(wss, { type: 'DEALER_PROFILE_SPX', data: prof });
+
+      lastDealerSPX = composite;
+      latest.dealer.spx = composite;
+      wsBroadcast(wss, { type: 'DEALER_PROFILE_SPX', data: composite });
     }
 
     // SPY profile (native SPY strikes)
@@ -679,19 +795,36 @@ async function pollDealerProfile() {
     } else if (!spyContracts.length) {
       latest.dealer.spy = { ...latest.dealer.spy, available: false, reason: 'no_spy_contracts', timestamp: new Date().toISOString() };
     } else {
-      const exp = pickNearestExpiry(spyContracts);
-      const prof = computeDealerProfile({ spot: spySpot, vix, contracts: spyContracts, expiration: exp, underlying: 'SPY' });
-      if (lastDealerSPY?.available) {
-        prof.changes = {
-          netGEX: prof.net.gex - lastDealerSPY.net.gex,
-          netVanna: prof.net.vanna - lastDealerSPY.net.vanna,
-          netCharm: prof.net.charm - lastDealerSPY.net.charm,
-          gammaFlip: (prof.levels.gammaFlip ?? 0) - (lastDealerSPY.levels.gammaFlip ?? 0),
+      const exps = pickExpiryBlend(spyContracts);
+      const d0 = exps.d0 ? computeDealerProfile({ spot: spySpot, vix, contracts: spyContracts, expiration: exps.d0, underlying: 'SPY' }) : null;
+      const wk = exps.weekly ? computeDealerProfile({ spot: spySpot, vix, contracts: spyContracts, expiration: exps.weekly, underlying: 'SPY' }) : null;
+      const blend = blendProfiles(d0, wk);
+
+      const composite = {
+        available: Boolean(blend?.available),
+        reason: blend?.available ? null : blend?.reason || 'unavailable',
+        timestamp: new Date().toISOString(),
+        underlying: 'SPY',
+        spot: spySpot,
+        vix,
+        expirations: exps,
+        d0,
+        weekly: wk,
+        blend,
+      };
+
+      if (lastDealerSPY?.blend?.available && composite.blend?.available) {
+        composite.changes = {
+          netGEX: composite.blend.net.gex - lastDealerSPY.blend.net.gex,
+          netVanna: composite.blend.net.vanna - lastDealerSPY.blend.net.vanna,
+          netCharm: composite.blend.net.charm - lastDealerSPY.blend.net.charm,
+          gammaFlip: (composite.blend.levels.gammaFlip ?? 0) - (lastDealerSPY.blend.levels.gammaFlip ?? 0),
         };
       }
-      lastDealerSPY = prof;
-      latest.dealer.spy = prof;
-      wsBroadcast(wss, { type: 'DEALER_PROFILE_SPY', data: prof });
+
+      lastDealerSPY = composite;
+      latest.dealer.spy = composite;
+      wsBroadcast(wss, { type: 'DEALER_PROFILE_SPY', data: composite });
     }
 
     computeSync();
@@ -711,7 +844,7 @@ function pushAlert(alert) {
 
 function scoreMove15({ spot, bars, dealer }) {
   // dealer now has spx/spy/sync; require at least SPX options for primary.
-  if (!spot || !bars?.length || !dealer?.spx?.available) return null;
+  if (!spot || !bars?.length || !dealer?.spx?.blend?.available) return null;
   // Simple first-pass engine (real data only):
   // - negative gamma + price accelerating away from flip + near a wall => higher probability of 15pt move
   const last = bars[0];
@@ -719,13 +852,13 @@ function scoreMove15({ spot, bars, dealer }) {
   if (!last || !prev) return null;
   const momentum = last.close - prev.close;
   const atr = null; // keep simple here; can expand
-  const flip = dealer.spx.levels.gammaFlip;
-  const call = dealer.spx.levels.callWall;
-  const put = dealer.spx.levels.putWall;
+  const flip = dealer.spx.blend.levels.gammaFlip;
+  const call = dealer.spx.blend.levels.callWall;
+  const put = dealer.spx.blend.levels.putWall;
   let score = 0;
   const reasons = [];
 
-  if (dealer.spx.net.gex < 0) {
+  if (dealer.spx.blend.net.gex < 0) {
     score += 25;
     reasons.push('SPX net dealer gamma < 0 (amplification regime)');
   } else {
@@ -757,9 +890,9 @@ function scoreMove15({ spot, bars, dealer }) {
   }
 
   // Cross-confirmation: SPY options agree with SPX options
-  if (dealer.spy?.available && dealer.sync?.available) {
-    const s1 = Math.sign(dealer.spx.net.gex || 0);
-    const s2 = Math.sign(dealer.spy.net.gex || 0);
+  if (dealer.spy?.blend?.available && dealer.sync?.available) {
+    const s1 = Math.sign(dealer.spx.blend.net.gex || 0);
+    const s2 = Math.sign(dealer.spy.blend.net.gex || 0);
     if (s1 !== 0 && s2 !== 0 && s1 === s2) {
       score += 10;
       reasons.push('SPY options confirm SPX gamma sign');
@@ -800,17 +933,19 @@ function maybeEmitMoveAlert() {
     reasons: s.reasons,
     dealer: {
       spx: {
-        netGEX: dealer.spx.net?.gex,
-        gammaFlip: dealer.spx.levels?.gammaFlip,
-        callWall: dealer.spx.levels?.callWall,
-        putWall: dealer.spx.levels?.putWall,
+        netGEX: dealer.spx.blend.net?.gex,
+        gammaFlip: dealer.spx.blend.levels?.gammaFlip,
+        callWall: dealer.spx.blend.levels?.callWall,
+        putWall: dealer.spx.blend.levels?.putWall,
+        expirations: dealer.spx.expirations,
       },
-      spy: dealer.spy?.available
+      spy: dealer.spy?.blend?.available
         ? {
-            netGEX: dealer.spy.net?.gex,
-            gammaFlip: dealer.spy.levels?.gammaFlip,
-            callWall: dealer.spy.levels?.callWall,
-            putWall: dealer.spy.levels?.putWall,
+            netGEX: dealer.spy.blend.net?.gex,
+            gammaFlip: dealer.spy.blend.levels?.gammaFlip,
+            callWall: dealer.spy.blend.levels?.callWall,
+            putWall: dealer.spy.blend.levels?.putWall,
+            expirations: dealer.spy.expirations,
           }
         : null,
       sync: dealer.sync || null,

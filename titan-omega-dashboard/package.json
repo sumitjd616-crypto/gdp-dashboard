@@ -8,6 +8,7 @@
     "dev": "vite",
     "server": "node server/index.js",
     "dev:all": "concurrently -k \"npm run server\" \"npm run dev\"",
+    "backtest:replay": "node server/backtest/replay.js",
     "build": "vite build",
     "preview": "vite preview"
   },
