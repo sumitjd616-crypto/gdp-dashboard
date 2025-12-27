@@ -35,6 +35,7 @@ const API_KEY =
 
 const WS_INDICES_URL = process.env.MASSIVE_WS_INDICES_URL || 'wss://socket.polygon.io/indices';
 const WS_STOCKS_URL = process.env.MASSIVE_WS_STOCKS_URL || 'wss://socket.polygon.io/stocks';
+const WS_OPTIONS_URL = process.env.MASSIVE_WS_OPTIONS_URL || 'wss://socket.polygon.io/options';
 const REST_BASE_URL = 'https://api.polygon.io';
 
 // Optional recorder (real data only, no secrets)
@@ -110,6 +111,16 @@ const latest = {
       agreement: null, // 0..100
       notes: [],
     },
+    flow: {
+      available: false,
+      timestamp: null,
+      windowSec: 30,
+      // Aggregated delta/gamma-ish pressure proxies from REAL option trades (seconds-level).
+      // These are *flows*, not OI, and are used to detect rapid positioning changes.
+      spx: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
+      spy: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
+      notes: [],
+    },
   },
   alerts: [], // newest-first
 };
@@ -183,6 +194,11 @@ app.get('/api/options/profile', (req, res) => {
   res.json({ ok: true, dealer: latest.dealer });
 });
 
+app.get('/api/options/flow', (req, res) => {
+  if (!requireToken(req, res)) return;
+  res.json({ ok: true, flow: latest.dealer.flow });
+});
+
 app.get('/api/prev', async (_req, res) => {
   if (!requireToken(_req, res)) return;
   if (!API_KEY) return res.status(400).json({ ok: false, error: 'Missing server API key (set MASSIVE_API_KEY)' });
@@ -250,8 +266,11 @@ let upstreamIndices = null;
 let upstreamIndicesAuthed = false;
 let upstreamStocks = null;
 let upstreamStocksAuthed = false;
+let upstreamOptions = null;
+let upstreamOptionsAuthed = false;
 let reconnectTimer = null;
 let reconnectTimerStocks = null;
+let reconnectTimerOptions = null;
 
 function connectUpstream() {
   if (!API_KEY) {
@@ -456,6 +475,125 @@ function scheduleReconnectStocks() {
   reconnectTimerStocks = setTimeout(() => {
     reconnectTimerStocks = null;
     connectUpstreamStocks();
+  }, 2000);
+}
+
+// ----------------------------
+// Options WebSocket (seconds-level flow)
+// ----------------------------
+
+// We dynamically subscribe to a small, high-signal set of option tickers:
+// - SPY 0DTE + nearest weekly around ATM (calls/puts)
+// - (Optional) SPX options tickers if available via snapshot results
+//
+// We then compute rolling-window deltaNotional/gammaNotional proxies:
+//   deltaNotional += dealerSignedDelta * size * 100 * underlyingPrice
+//   gammaNotional += dealerSignedGamma * size * 100 * underlyingPrice^2
+//
+// Dealer sign convention matches the rest: calls negative, puts positive.
+const optionGreeksByTicker = new Map(); // ticker -> { delta, gamma, type, underlying }
+const optionFlowEvents = []; // [{ ts, underlying, deltaNotional, gammaNotional }]
+let currentOptionSubs = new Set();
+
+function pruneFlow(windowMs) {
+  const cutoff = Date.now() - windowMs;
+  while (optionFlowEvents.length && optionFlowEvents[0].ts < cutoff) optionFlowEvents.shift();
+}
+
+function recomputeFlow(windowSec = 30) {
+  pruneFlow(windowSec * 1000);
+  const agg = {
+    available: upstreamOptionsAuthed,
+    timestamp: new Date().toISOString(),
+    windowSec,
+    spx: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
+    spy: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
+    notes: [],
+  };
+  for (const e of optionFlowEvents) {
+    const bucket = e.underlying === 'SPX' ? agg.spx : e.underlying === 'SPY' ? agg.spy : null;
+    if (!bucket) continue;
+    bucket.deltaNotional += e.deltaNotional;
+    bucket.gammaNotional += e.gammaNotional;
+    bucket.trades += 1;
+  }
+  latest.dealer.flow = agg;
+}
+
+function connectUpstreamOptions() {
+  if (!API_KEY) return;
+  if (upstreamOptions) {
+    try {
+      upstreamOptions.close();
+    } catch {
+      // ignore
+    }
+  }
+
+  upstreamOptionsAuthed = false;
+  upstreamOptions = new WebSocket(WS_OPTIONS_URL);
+
+  upstreamOptions.on('open', () => {
+    upstreamOptions.send(JSON.stringify({ action: 'auth', params: API_KEY }));
+  });
+
+  upstreamOptions.on('message', (buf) => {
+    const messages = safeJsonParse(buf.toString());
+    if (!messages) return;
+    const list = Array.isArray(messages) ? messages : [messages];
+    for (const msg of list) {
+      if (msg?.ev === 'status') {
+        if (msg.status === 'auth_success') {
+          upstreamOptionsAuthed = true;
+          // Subscribe to current set if we have one
+          if (currentOptionSubs.size) {
+            upstreamOptions.send(JSON.stringify({ action: 'subscribe', params: Array.from(currentOptionSubs).join(',') }));
+          }
+          recomputeFlow(latest.dealer.flow.windowSec || 30);
+          wsBroadcast(wss, { type: 'DEALER_FLOW', data: latest.dealer.flow });
+        }
+        continue;
+      }
+      if (!upstreamOptionsAuthed) continue;
+
+      // Options trade events: Polygon uses ev:'T' with msg.sym as option ticker (e.g. "O:SPY...")
+      if (msg?.ev === 'T' && msg.sym && String(msg.sym).startsWith('O:')) {
+        const ticker = String(msg.sym);
+        const g = optionGreeksByTicker.get(ticker);
+        if (!g) continue; // only track what we have greeks for (real)
+
+        const size = Number(msg.s || 0);
+        const ts = Number(msg.t || Date.now());
+        if (!size) continue;
+
+        const under = g.underlying;
+        const spot = under === 'SPX' ? Number(latest.SPX?.price) : under === 'SPY' ? Number(latest.SPY?.price) : null;
+        if (!spot) continue;
+
+        const delta = Number(g.delta || 0);
+        const gamma = Number(g.gamma || 0);
+        const dealerSign = g.type === 'call' ? -1 : 1;
+
+        const deltaNotional = dealerSign * delta * size * 100 * spot;
+        const gammaNotional = dealerSign * gamma * size * 100 * spot * spot;
+
+        optionFlowEvents.push({ ts, underlying: under, deltaNotional, gammaNotional });
+        pruneFlow((latest.dealer.flow.windowSec || 30) * 1000);
+        recomputeFlow(latest.dealer.flow.windowSec || 30);
+        wsBroadcast(wss, { type: 'DEALER_FLOW', data: latest.dealer.flow });
+      }
+    }
+  });
+
+  upstreamOptions.on('close', () => scheduleReconnectOptions());
+  upstreamOptions.on('error', () => scheduleReconnectOptions());
+}
+
+function scheduleReconnectOptions() {
+  if (reconnectTimerOptions) return;
+  reconnectTimerOptions = setTimeout(() => {
+    reconnectTimerOptions = null;
+    connectUpstreamOptions();
   }, 2000);
 }
 
@@ -829,6 +967,66 @@ async function pollDealerProfile() {
 
     computeSync();
     wsBroadcast(wss, { type: 'DEALER_SYNC', data: latest.dealer.sync });
+
+    // Update options WS subscriptions to track seconds-level flow around ATM for 0DTE+weekly.
+    // We only subscribe to a limited set to keep it efficient.
+    const subTickers = new Set();
+    optionGreeksByTicker.clear();
+
+    const addSubs = (composite, underlying) => {
+      const spotPx = Number(composite?.spot);
+      if (!spotPx || !composite?.blend?.available) return;
+      const near = (arr) =>
+        (arr || [])
+          .filter((s) => Math.abs(Number(s.strike) - spotPx) <= (underlying === 'SPX' ? 100 : 10))
+          .sort((a, b) => Math.abs(Number(a.strike) - spotPx) - Math.abs(Number(b.strike) - spotPx))
+          .slice(0, 40);
+
+      // Use snapshot contracts to map tickers -> greeks; prefer 0DTE + weekly expirations.
+      const expirations = [composite.expirations?.d0, composite.expirations?.weekly].filter(Boolean);
+      const contracts = underlying === 'SPX' ? spxContracts : spyContracts;
+
+      // Build a quick index: strike+type+exp -> ticker+greeks
+      for (const c of contracts) {
+        const d = c.details;
+        if (!d) continue;
+        if (!expirations.includes(d.expiration_date)) continue;
+        const strike = Number(d.strike_price);
+        const type = d.contract_type;
+        const ticker = d.ticker;
+        if (!ticker) continue;
+        if (Math.abs(strike - (underlying === 'SPX' ? spotPx : spotPx)) > (underlying === 'SPX' ? 100 : 10)) continue;
+
+        // store greeks for flow inference
+        optionGreeksByTicker.set(ticker, {
+          delta: Number(c.greeks?.delta || 0),
+          gamma: Number(c.greeks?.gamma || 0),
+          type,
+          underlying,
+        });
+      }
+
+      // Subscribe to tickers we have greeks for
+      for (const [ticker, g] of optionGreeksByTicker) {
+        if (g.underlying !== underlying) continue;
+        // Options WS uses trade channel "T.<ticker>"
+        subTickers.add(`T.${ticker}`);
+      }
+    };
+
+    if (latest.dealer.spx?.available) addSubs(latest.dealer.spx, 'SPX');
+    if (latest.dealer.spy?.available) addSubs(latest.dealer.spy, 'SPY');
+
+    // Apply new subscriptions (diff)
+    const next = subTickers;
+    const toAdd = Array.from(next).filter((x) => !currentOptionSubs.has(x));
+    const toRemove = Array.from(currentOptionSubs).filter((x) => !next.has(x));
+    currentOptionSubs = next;
+
+    if (upstreamOptionsAuthed && upstreamOptions) {
+      if (toRemove.length) upstreamOptions.send(JSON.stringify({ action: 'unsubscribe', params: toRemove.join(',') }));
+      if (toAdd.length) upstreamOptions.send(JSON.stringify({ action: 'subscribe', params: toAdd.join(',') }));
+    }
   } catch (e) {
     latest.dealer.spx = { ...latest.dealer.spx, available: false, reason: String(e?.message || e), timestamp: new Date().toISOString() };
     latest.dealer.spy = { ...latest.dealer.spy, available: false, reason: String(e?.message || e), timestamp: new Date().toISOString() };
@@ -851,7 +1049,6 @@ function scoreMove15({ spot, bars, dealer }) {
   const prev = bars[1];
   if (!last || !prev) return null;
   const momentum = last.close - prev.close;
-  const atr = null; // keep simple here; can expand
   const flip = dealer.spx.blend.levels.gammaFlip;
   const call = dealer.spx.blend.levels.callWall;
   const put = dealer.spx.blend.levels.putWall;
@@ -904,6 +1101,21 @@ function scoreMove15({ spot, bars, dealer }) {
   }
 
   const direction = momentum >= 0 ? 'UP' : 'DOWN';
+
+  // Seconds-level flow impulse (options WS)
+  if (dealer.flow?.available) {
+    const f = dealer.flow;
+    const flow = f.spx?.gammaNotional || 0;
+    if (direction === 'UP' && flow < 0) {
+      score += 8;
+      reasons.push('SPX options flow implies hedging buy impulse');
+    }
+    if (direction === 'DOWN' && flow > 0) {
+      score += 8;
+      reasons.push('SPX options flow implies hedging sell impulse');
+    }
+  }
+
   const threshold = 65;
 
   return {
@@ -959,6 +1171,7 @@ server.listen(PORT, () => {
   console.log(`Titan Omega backend listening on :${PORT}`);
   connectUpstream();
   connectUpstreamStocks();
+  connectUpstreamOptions();
 
   // Options + alerts loops (real data only)
   pollDealerProfile();

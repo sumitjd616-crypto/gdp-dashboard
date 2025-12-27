@@ -312,6 +312,14 @@ class MassiveService {
         return;
       }
 
+      if (messages.type === 'DEALER_FLOW') {
+        if (!this.data.dealer) this.data.dealer = {};
+        this.data.dealer.flow = messages.data;
+        this.saveSession();
+        this.onDataUpdate?.('dealer', 'FLOW', this.data);
+        return;
+      }
+
       if (messages.type === 'ALERT') {
         this.data.alerts.unshift(messages.data);
         if (this.data.alerts.length > 200) this.data.alerts.pop();

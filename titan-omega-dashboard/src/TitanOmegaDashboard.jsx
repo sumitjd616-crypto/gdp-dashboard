@@ -308,6 +308,23 @@ export default function TitanOmegaDashboard() {
                 )}
               </div>
             )}
+
+            {dealer?.flow?.available && (
+              <div className="mt-3 text-xs text-gray-400">
+                <div className="flex items-center justify-between">
+                  <span className="text-gray-500">Flow window</span>
+                  <span className="font-mono">{dealer.flow.windowSec}s</span>
+                </div>
+                <div className="flex items-center justify-between mt-1">
+                  <span className="text-gray-500">SPX flow γNotional</span>
+                  <span className="font-mono">{Number(dealer.flow.spx?.gammaNotional || 0).toFixed(0)}</span>
+                </div>
+                <div className="flex items-center justify-between mt-1">
+                  <span className="text-gray-500">SPY flow γNotional</span>
+                  <span className="font-mono">{Number(dealer.flow.spy?.gammaNotional || 0).toFixed(0)}</span>
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
