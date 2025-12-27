@@ -41,6 +41,27 @@ const REST_BASE_URL = 'https://api.polygon.io';
 // Optional recorder (real data only, no secrets)
 const RECORD_PATH = process.env.RECORD_PATH || '';
 
+// Alert + risk configuration (pro-trader defaults; override via env)
+const CFG = {
+  headsUpMinScore: Number(process.env.HEADSUP_MIN_SCORE || 60),
+  triggerMinScore: Number(process.env.TRIGGER_MIN_SCORE || 65),
+  headsUpCooldownMs: Number(process.env.HEADSUP_COOLDOWN_MS || 20_000),
+  triggerCooldownMs: Number(process.env.TRIGGER_COOLDOWN_MS || 60_000),
+  minAgreement: Number(process.env.MIN_DEALER_AGREEMENT || 45),
+  dealerFreshMs: Number(process.env.DEALER_FRESH_MS || 90_000),
+  barFreshMs: Number(process.env.BAR_FRESH_MS || 120_000),
+  // Risk model: structure + realized volatility (all from real price)
+  stopMinPts: Number(process.env.STOP_MIN_PTS || 8),
+  stopAtrMult: Number(process.env.STOP_ATR_MULT || 0.5),
+  stopBufferPts: Number(process.env.STOP_BUFFER_PTS || 2),
+  // Targets
+  tp1Pts: Number(process.env.TP1_PTS || 10),
+  tp2Pts: Number(process.env.TP2_PTS || 15),
+  tp3Pts: Number(process.env.TP3_PTS || 25),
+  // Trade time-to-live for 0DTE style scalps
+  ttlMinutes: Number(process.env.TRADE_TTL_MIN || 60),
+};
+
 const app = express();
 const server = http.createServer(app);
 
@@ -152,6 +173,102 @@ function wsBroadcast(wss, payload) {
   }
   // Record broadcast payload (no secrets)
   recordEvent('broadcast', payload);
+}
+
+function isRthNowET(tsMs) {
+  // Very lightweight: estimate using America/New_York clock via Intl
+  // We intentionally avoid external deps. This is used only as a soft score/gate.
+  try {
+    const d = new Date(tsMs);
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(d);
+    const hh = Number(parts.find((p) => p.type === 'hour')?.value || 0);
+    const mm = Number(parts.find((p) => p.type === 'minute')?.value || 0);
+    const minutes = hh * 60 + mm;
+    // 9:30 (570) to 16:00 (960)
+    return minutes >= 570 && minutes <= 960;
+  } catch {
+    return true;
+  }
+}
+
+function computeATRFromBars(newestFirstBars, period = 14) {
+  if (!Array.isArray(newestFirstBars) || newestFirstBars.length < period + 2) return null;
+  const bars = [...newestFirstBars].slice(0, period + 2).reverse(); // oldest->newest
+  const trs = [];
+  for (let i = 1; i < bars.length; i += 1) {
+    const hi = Number(bars[i].high);
+    const lo = Number(bars[i].low);
+    const pc = Number(bars[i - 1].close);
+    if (!Number.isFinite(hi) || !Number.isFinite(lo) || !Number.isFinite(pc)) continue;
+    trs.push(Math.max(hi - lo, Math.abs(hi - pc), Math.abs(lo - pc)));
+  }
+  if (!trs.length) return null;
+  const tail = trs.slice(-period);
+  return tail.reduce((a, b) => a + b, 0) / tail.length;
+}
+
+function buildTradePlan({ ts, spot, direction, dealer }) {
+  const dir = direction === 'DOWN' ? -1 : 1;
+  const flip = dealer?.spx?.gammaFlip ?? null;
+  const call = dealer?.spx?.callWall ?? null;
+  const put = dealer?.spx?.putWall ?? null;
+
+  const atr = computeATRFromBars(latest.bars.SPX, 14);
+  const volStop = atr ? Math.max(CFG.stopMinPts, atr * CFG.stopAtrMult) : CFG.stopMinPts;
+
+  // Structure stop: opposite side of the nearest structural level with a buffer.
+  let structuralStop = null;
+  if (dir === 1) {
+    // long: invalid below max(putWall, flip) - buffer
+    const ref = [put, flip].filter((x) => Number.isFinite(Number(x))).sort((a, b) => b - a)[0];
+    if (ref != null) structuralStop = Number(ref) - CFG.stopBufferPts;
+  } else {
+    // short: invalid above min(callWall, flip) + buffer
+    const ref = [call, flip].filter((x) => Number.isFinite(Number(x))).sort((a, b) => a - b)[0];
+    if (ref != null) structuralStop = Number(ref) + CFG.stopBufferPts;
+  }
+
+  // Fallback stop: fixed points
+  const fixedStop = spot - dir * volStop;
+
+  // Choose more conservative stop (tighter) if it still makes sense, otherwise use fixed.
+  const stop = structuralStop != null ? structuralStop : fixedStop;
+  const riskPts = Math.abs(spot - stop);
+
+  const tp1 = spot + dir * CFG.tp1Pts;
+  const tp2 = spot + dir * CFG.tp2Pts;
+  const tp3 = spot + dir * CFG.tp3Pts;
+
+  const ttlMs = CFG.ttlMinutes * 60_000;
+
+  const plan = {
+    entry: spot,
+    direction,
+    stop,
+    riskPts,
+    targets: [tp1, tp2, tp3],
+    ttlMinutes: CFG.ttlMinutes,
+    expiresAt: ts + ttlMs,
+    rationale: {
+      stopModel: structuralStop != null ? 'STRUCTURE+BUFFER' : atr ? 'ATR' : 'FIXED',
+      atr: atr ?? null,
+      flip,
+      callWall: call,
+      putWall: put,
+    },
+    execution: {
+      // Human-friendly: scale out & protect
+      suggestion: 'Scale: take partial at TP1, trail stop after TP1, exit remainder by TTL if not hit.',
+      invalidation: 'If stop breaks, exit immediately (no averaging).',
+    },
+  };
+
+  return plan;
 }
 
 async function fetchJson(url) {
@@ -1116,13 +1233,11 @@ function scoreMove15({ spot, bars, dealer }) {
     }
   }
 
-  const threshold = 65;
-
   return {
     score,
     direction,
-    headsUp: score >= 60,
-    trigger: score >= threshold,
+    headsUp: score >= CFG.headsUpMinScore,
+    trigger: score >= CFG.triggerMinScore,
     reasons,
   };
 }
@@ -1161,7 +1276,7 @@ function maybeEmitMoveAlert() {
   };
 
   // Tier 1: HEADS-UP (high recall, low spam)
-  if (s.headsUp && now - lastHeadsUpTs >= 20_000) {
+  if (s.headsUp && now - lastHeadsUpTs >= CFG.headsUpCooldownMs) {
     lastHeadsUpTs = now;
     pushAlert({
       type: 'MOVE_15PT_HEADS_UP',
@@ -1171,19 +1286,21 @@ function maybeEmitMoveAlert() {
       direction: s.direction,
       score: s.score,
       reasons: s.reasons,
+      plan: buildTradePlan({ ts: now, spot, direction: s.direction, dealer: dealerPayload }),
       dealer: dealerPayload,
     });
   }
 
   // Tier 2: TRIGGER (high precision, confirmation required)
   // Confirmation: (a) score threshold, (b) fresh options profile, (c) fresh SPX bar, (d) dealer agreement not terrible
-  const dealerFresh = dealer.spx?.blend?.timestamp ? now - Date.parse(dealer.spx.blend.timestamp) < 90_000 : false;
-  const barFresh = latest.status.lastSPXBarTs ? now - Number(latest.status.lastSPXBarTs) < 120_000 : false;
+  const dealerFresh = dealer.spx?.blend?.timestamp ? now - Date.parse(dealer.spx.blend.timestamp) < CFG.dealerFreshMs : false;
+  const barFresh = latest.status.lastSPXBarTs ? now - Number(latest.status.lastSPXBarTs) < CFG.barFreshMs : false;
   const agreement = Number(dealer.sync?.agreement || 0);
-  const okAgreement = !dealer.sync?.available || agreement >= 45;
+  const okAgreement = !dealer.sync?.available || agreement >= CFG.minAgreement;
+  const okSession = isRthNowET(now);
 
-  if (s.trigger && dealerFresh && barFresh && okAgreement) {
-    if (now - lastAlertTs < 60_000) return; // 1/min max triggers
+  if (s.trigger && dealerFresh && barFresh && okAgreement && okSession) {
+    if (now - lastAlertTs < CFG.triggerCooldownMs) return; // max trigger rate
     lastAlertTs = now;
     pushAlert({
       type: 'MOVE_15PT_TRIGGER',
@@ -1193,6 +1310,7 @@ function maybeEmitMoveAlert() {
       direction: s.direction,
       score: s.score,
       reasons: [...s.reasons, 'Trigger confirmations passed'],
+      plan: buildTradePlan({ ts: now, spot, direction: s.direction, dealer: dealerPayload }),
       dealer: dealerPayload,
     });
   }

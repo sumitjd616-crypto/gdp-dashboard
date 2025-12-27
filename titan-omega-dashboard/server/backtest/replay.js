@@ -45,15 +45,17 @@ function gradeAlert(a) {
 }
 
 function evaluateAlert(alert, barsByTs, opts) {
-  const entry = Number(alert.spot);
+  const entry = Number(alert.plan?.entry ?? alert.spot);
   const dir = alert.direction === 'DOWN' ? -1 : 1;
 
-  const target = entry + dir * opts.targetPts;
-  const stop = entry - dir * opts.stopPts;
+  const targets = Array.isArray(alert.plan?.targets) ? alert.plan.targets.map(Number) : [entry + dir * opts.targetPts];
+  const target = targets[1] ?? targets[0]; // prefer TP2 (=15) if present
+  const stop = Number(alert.plan?.stop ?? (entry - dir * opts.stopPts));
 
   // collect bars after alert ts within horizon
   const start = Number(alert.ts);
-  const end = start + opts.horizonMin * 60_000;
+  const ttlMin = Number(alert.plan?.ttlMinutes ?? opts.horizonMin);
+  const end = start + ttlMin * 60_000;
 
   const bars = [];
   for (const [ts, bar] of barsByTs) {
@@ -107,6 +109,7 @@ function evaluateAlert(alert, barsByTs, opts) {
     entry,
     target,
     stop,
+    targets,
     mfe,
     mae,
     minutesToOutcome: dtMin,
