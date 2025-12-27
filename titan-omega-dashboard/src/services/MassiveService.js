@@ -288,6 +288,30 @@ class MassiveService {
         return;
       }
 
+      if (messages.type === 'DEALER_PROFILE_SPX') {
+        if (!this.data.dealer) this.data.dealer = {};
+        this.data.dealer.spx = messages.data;
+        this.saveSession();
+        this.onDataUpdate?.('dealer', 'SPX', this.data);
+        return;
+      }
+
+      if (messages.type === 'DEALER_PROFILE_SPY') {
+        if (!this.data.dealer) this.data.dealer = {};
+        this.data.dealer.spy = messages.data;
+        this.saveSession();
+        this.onDataUpdate?.('dealer', 'SPY', this.data);
+        return;
+      }
+
+      if (messages.type === 'DEALER_SYNC') {
+        if (!this.data.dealer) this.data.dealer = {};
+        this.data.dealer.sync = messages.data;
+        this.saveSession();
+        this.onDataUpdate?.('dealer', 'SYNC', this.data);
+        return;
+      }
+
       if (messages.type === 'ALERT') {
         this.data.alerts.unshift(messages.data);
         if (this.data.alerts.length > 200) this.data.alerts.pop();

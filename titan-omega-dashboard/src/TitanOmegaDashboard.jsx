@@ -262,27 +262,50 @@ export default function TitanOmegaDashboard() {
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
             <div className="flex items-center justify-between mb-2">
               <div className="text-sm font-semibold text-gray-300">Dealer positioning (real options)</div>
-              <Badge color={dealer?.available ? 'green' : 'yellow'}>{dealer?.available ? 'LIVE' : 'UNAVAILABLE'}</Badge>
+              <Badge color={dealer?.spx?.available || dealer?.spy?.available ? 'green' : 'yellow'}>
+                {dealer?.spx?.available || dealer?.spy?.available ? 'LIVE' : 'UNAVAILABLE'}
+              </Badge>
             </div>
-            {!dealer?.available && <div className="text-xs text-gray-400">{dealer?.reason || 'Waiting for first options snapshot…'}</div>}
-            {dealer?.available && (
+            {!dealer?.spx?.available && !dealer?.spy?.available && (
+              <div className="text-xs text-gray-400">Waiting for first SPX+SPY options snapshots…</div>
+            )}
+
+            {(dealer?.spx?.available || dealer?.spy?.available) && (
               <div className="grid grid-cols-2 gap-2 text-xs">
                 <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
-                  <div className="text-gray-500">Net GEX</div>
-                  <div className="font-mono font-bold">{Number(dealer.net?.gex || 0).toFixed(0)}</div>
+                  <div className="text-gray-500">SPX Net GEX</div>
+                  <div className="font-mono font-bold">{dealer?.spx?.available ? Number(dealer.spx.net?.gex || 0).toFixed(0) : '—'}</div>
                 </div>
                 <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
-                  <div className="text-gray-500">Net Vanna</div>
-                  <div className="font-mono font-bold">{Number(dealer.net?.vanna || 0).toFixed(0)}</div>
+                  <div className="text-gray-500">SPY Net GEX</div>
+                  <div className="font-mono font-bold">{dealer?.spy?.available ? Number(dealer.spy.net?.gex || 0).toFixed(0) : '—'}</div>
                 </div>
                 <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
-                  <div className="text-gray-500">Net Charm</div>
-                  <div className="font-mono font-bold">{Number(dealer.net?.charm || 0).toFixed(0)}</div>
+                  <div className="text-gray-500">SPX γ-Flip</div>
+                  <div className="font-mono font-bold">{dealer?.spx?.available ? dealer.spx.levels?.gammaFlip ?? '—' : '—'}</div>
                 </div>
                 <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
-                  <div className="text-gray-500">Expiry</div>
-                  <div className="font-mono font-bold">{dealer.expiration || '—'}</div>
+                  <div className="text-gray-500">SPY γ-Flip</div>
+                  <div className="font-mono font-bold">{dealer?.spy?.available ? dealer.spy.levels?.gammaFlip ?? '—' : '—'}</div>
                 </div>
+              </div>
+            )}
+
+            {dealer?.sync?.available && (
+              <div className="mt-3 text-xs text-gray-400">
+                <div className="flex items-center justify-between">
+                  <span className="text-gray-500">SPX↔SPY basis</span>
+                  <span className="font-mono">
+                    {Number(dealer.sync.basis || 0).toFixed(2)} ({Number(dealer.sync.basisPct || 0).toFixed(2)}%)
+                  </span>
+                </div>
+                <div className="flex items-center justify-between mt-1">
+                  <span className="text-gray-500">Dealer agreement</span>
+                  <span className="font-mono font-bold">{dealer.sync.agreement}</span>
+                </div>
+                {Array.isArray(dealer.sync.notes) && dealer.sync.notes.length > 0 && (
+                  <div className="text-gray-500 mt-1">{dealer.sync.notes.slice(0, 2).join(' · ')}</div>
+                )}
               </div>
             )}
           </div>
