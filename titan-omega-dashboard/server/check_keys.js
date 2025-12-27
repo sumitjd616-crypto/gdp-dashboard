@@ -1,8 +1,10 @@
 import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
+import { WebSocket } from 'ws';
 
 const REST_BASE_URL = 'https://api.polygon.io';
+const WS_OPTIONS_URL = process.env.MASSIVE_WS_OPTIONS_URL || 'wss://socket.polygon.io/options';
 
 function parseKeyRing() {
   const raw = process.env.MASSIVE_API_KEYS || process.env.POLYGON_API_KEYS || process.env.MASSIVE_API_KEY || process.env.POLYGON_API_KEY || '';
@@ -66,10 +68,65 @@ async function fetchJson(url) {
   return data;
 }
 
+async function probeOptionsWsAuth(key, timeoutMs = 2500) {
+  // Only checks auth_success vs auth_failed; does not subscribe.
+  // Returns: true/false/null (null = timeout/error).
+  return await new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      resolve(v);
+    };
+
+    const ws = new WebSocket(WS_OPTIONS_URL);
+    const t = setTimeout(() => finish(null), timeoutMs);
+
+    ws.on('open', () => {
+      try {
+        ws.send(JSON.stringify({ action: 'auth', params: key }));
+      } catch {
+        clearTimeout(t);
+        finish(null);
+      }
+    });
+
+    ws.on('message', (buf) => {
+      const s = buf.toString();
+      if (s.includes('auth_success')) {
+        clearTimeout(t);
+        finish(true);
+      } else if (s.includes('auth_failed')) {
+        clearTimeout(t);
+        finish(false);
+      }
+    });
+
+    ws.on('error', () => {
+      clearTimeout(t);
+      finish(null);
+    });
+
+    ws.on('close', () => {
+      clearTimeout(t);
+      finish(null);
+    });
+  });
+}
+
 async function probeKeyOnce(key) {
   const caps = {
     indicesPrev: false,
     optionsSpySnapshot: false,
+    optionsQqqSnapshot: false,
+    optionsSpxSnapshot: false,
+    optionsSpxwSnapshot: false,
+    optionsWsAuth: null,
   };
 
   try {
@@ -85,6 +142,29 @@ async function probeKeyOnce(key) {
   } catch {
     caps.optionsSpySnapshot = false;
   }
+
+  try {
+    await fetchJson(`${REST_BASE_URL}/v3/snapshot/options/QQQ?limit=1&apiKey=${encodeURIComponent(key)}`);
+    caps.optionsQqqSnapshot = true;
+  } catch {
+    caps.optionsQqqSnapshot = false;
+  }
+
+  try {
+    await fetchJson(`${REST_BASE_URL}/v3/snapshot/options/SPX?limit=1&apiKey=${encodeURIComponent(key)}`);
+    caps.optionsSpxSnapshot = true;
+  } catch {
+    caps.optionsSpxSnapshot = false;
+  }
+
+  try {
+    await fetchJson(`${REST_BASE_URL}/v3/snapshot/options/SPXW?limit=1&apiKey=${encodeURIComponent(key)}`);
+    caps.optionsSpxwSnapshot = true;
+  } catch {
+    caps.optionsSpxwSnapshot = false;
+  }
+
+  caps.optionsWsAuth = await probeOptionsWsAuth(key, 2500);
 
   const ok = Boolean(caps.indicesPrev && caps.optionsSpySnapshot);
   return { ok, caps };

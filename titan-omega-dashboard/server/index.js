@@ -524,6 +524,9 @@ async function probeKeyOnce(key) {
   const caps = {
     indicesPrev: false,
     optionsSpySnapshot: false,
+    optionsQqqSnapshot: false,
+    optionsSpxSnapshot: false,
+    optionsSpxwSnapshot: false,
   };
   try {
     await fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/I:SPX/prev?apiKey=${encodeURIComponent(key)}`);
@@ -536,6 +539,24 @@ async function probeKeyOnce(key) {
     caps.optionsSpySnapshot = true;
   } catch {
     caps.optionsSpySnapshot = false;
+  }
+  try {
+    await fetchJson(`${REST_BASE_URL}/v3/snapshot/options/QQQ?limit=1&apiKey=${encodeURIComponent(key)}`);
+    caps.optionsQqqSnapshot = true;
+  } catch {
+    caps.optionsQqqSnapshot = false;
+  }
+  try {
+    await fetchJson(`${REST_BASE_URL}/v3/snapshot/options/SPX?limit=1&apiKey=${encodeURIComponent(key)}`);
+    caps.optionsSpxSnapshot = true;
+  } catch {
+    caps.optionsSpxSnapshot = false;
+  }
+  try {
+    await fetchJson(`${REST_BASE_URL}/v3/snapshot/options/SPXW?limit=1&apiKey=${encodeURIComponent(key)}`);
+    caps.optionsSpxwSnapshot = true;
+  } catch {
+    caps.optionsSpxwSnapshot = false;
   }
   const ok = Boolean(caps.indicesPrev && caps.optionsSpySnapshot);
   return { ok, caps };
