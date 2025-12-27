@@ -37,11 +37,42 @@ function parseKeyRing() {
     process.env.VITE_POLYGON_API_KEY ||
     process.env.VITE_MASSIVE_API_KEY ||
     '';
-  const keys = String(raw)
+  const fromEnv = String(raw)
     .split(/[\n,\s]+/g)
     .map((s) => s.trim())
     .filter(Boolean);
-  return Array.from(new Set(keys));
+  if (fromEnv.length >= 2) return Array.from(new Set(fromEnv));
+
+  // Fallback: support users pasting multiple raw keys on separate lines in .env
+  // (dotenv only captures the first line of MASSIVE_API_KEYS)
+  try {
+    const p = path.join(process.cwd(), '.env');
+    const txt = fs.readFileSync(p, 'utf8');
+    const lines = txt.split(/\r?\n/);
+    const out = [...fromEnv];
+    for (const line of lines) {
+      const t = String(line || '').trim();
+      if (!t || t.startsWith('#')) continue;
+      if (t.includes('=')) {
+        const [k, v] = t.split('=', 2);
+        if (k === 'MASSIVE_API_KEYS' || k === 'POLYGON_API_KEYS') {
+          out.push(
+            ...String(v || '')
+              .split(/[\n,\s]+/g)
+              .map((s) => s.trim())
+              .filter(Boolean)
+          );
+        } else if (k === 'MASSIVE_API_KEY' || k === 'POLYGON_API_KEY') {
+          if (v) out.push(String(v).trim());
+        }
+        continue;
+      }
+      if (/^[A-Za-z0-9_]{20,}$/.test(t)) out.push(t);
+    }
+    return Array.from(new Set(out.filter(Boolean)));
+  } catch {
+    return Array.from(new Set(fromEnv));
+  }
 }
 
 function maskKey(k) {
