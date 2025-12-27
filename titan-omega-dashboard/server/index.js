@@ -72,6 +72,8 @@ const CFG = {
   optionsPollMs: Number(process.env.OPTIONS_POLL_MS || 20_000),
   // Flow window (seconds-level) for impulse detection
   flowWindowSec: Number(process.env.FLOW_WINDOW_SEC || 15),
+  // Broadcast consolidated state to UI
+  stateBroadcastMs: Number(process.env.STATE_BROADCAST_MS || 1000),
 };
 
 const app = express();
@@ -186,6 +188,80 @@ const latest = {
   },
   alerts: [], // newest-first
 };
+
+function computeRealtimeDealerPulse() {
+  // 1Hz “pulse”: combines *latest snapshot* + *seconds-level flow* + *spot drift*.
+  // This is NOT new options-chain data; it’s a real-time interpretation layer.
+  const now = Date.now();
+  const spxSpot = Number(latest.SPX?.price) || null;
+  const spySpot = Number(latest.SPY?.price) || null;
+
+  const spxBlend = latest.dealer?.spx?.blend?.available ? latest.dealer.spx.blend : null;
+  const spyBlend = latest.dealer?.spy?.blend?.available ? latest.dealer.spy.blend : null;
+
+  const flow = latest.dealer?.flow?.available ? latest.dealer.flow : null;
+
+  const pulse = {
+    timestamp: new Date().toISOString(),
+    spx: {
+      spot: spxSpot,
+      flip: spxBlend?.levels?.gammaFlip ?? null,
+      callWall: spxBlend?.levels?.callWall ?? null,
+      putWall: spxBlend?.levels?.putWall ?? null,
+      netGEX: spxBlend?.net?.gex ?? null,
+      // Spot displacement from flip/walls (real)
+      dFlip: spxSpot != null && spxBlend?.levels?.gammaFlip != null ? spxSpot - spxBlend.levels.gammaFlip : null,
+      dCall: spxSpot != null && spxBlend?.levels?.callWall != null ? spxBlend.levels.callWall - spxSpot : null,
+      dPut: spxSpot != null && spxBlend?.levels?.putWall != null ? spxSpot - spxBlend.levels.putWall : null,
+      // Seconds-level flow impulse (real)
+      flowGammaNotional: flow?.spx?.gammaNotional ?? null,
+      flowDeltaNotional: flow?.spx?.deltaNotional ?? null,
+      flowTrades: flow?.spx?.trades ?? null,
+      // Simple “pressure” heuristic (real inputs only)
+      // Negative gammaNotional here tends to correspond to buy-hedging impulse (in our sign convention).
+      impulse: flow?.spx?.gammaNotional != null ? (flow.spx.gammaNotional < 0 ? 'BUY_IMPULSE' : flow.spx.gammaNotional > 0 ? 'SELL_IMPULSE' : 'NEUTRAL') : 'UNKNOWN',
+    },
+    spy: {
+      spot: spySpot,
+      flip: spyBlend?.levels?.gammaFlip ?? null,
+      callWall: spyBlend?.levels?.callWall ?? null,
+      putWall: spyBlend?.levels?.putWall ?? null,
+      netGEX: spyBlend?.net?.gex ?? null,
+      flowGammaNotional: flow?.spy?.gammaNotional ?? null,
+      flowDeltaNotional: flow?.spy?.deltaNotional ?? null,
+      flowTrades: flow?.spy?.trades ?? null,
+      impulse: flow?.spy?.gammaNotional != null ? (flow.spy.gammaNotional < 0 ? 'BUY_IMPULSE' : flow.spy.gammaNotional > 0 ? 'SELL_IMPULSE' : 'NEUTRAL') : 'UNKNOWN',
+    },
+    sync: latest.dealer?.sync ?? null,
+    freshness: {
+      spxTickMs: latest.status.lastSPXTs ? now - Number(latest.status.lastSPXTs) : null,
+      spyTickMs: latest.SPY?.timestamp ? now - Number(latest.SPY.timestamp) : null,
+      flowMs: latest.dealer?.flow?.timestamp ? now - Date.parse(latest.dealer.flow.timestamp) : null,
+      spxSnapshotMs: spxBlend?.timestamp ? now - Date.parse(spxBlend.timestamp) : null,
+      spySnapshotMs: spyBlend?.timestamp ? now - Date.parse(spyBlend.timestamp) : null,
+    },
+  };
+
+  latest.dealer.pulse = pulse;
+  return pulse;
+}
+
+function broadcastState() {
+  // 1Hz state broadcast for smooth UI
+  computeRealtimeDealerPulse();
+  wsBroadcast(wss, {
+    type: 'STATE',
+    data: {
+      status: latest.status,
+      SPX: latest.SPX,
+      VIX: latest.VIX,
+      SPY: latest.SPY,
+      bars: latest.bars,
+      dealer: latest.dealer,
+      alerts: latest.alerts,
+    },
+  });
+}
 
 function recordEvent(type, payload) {
   if (!RECORD_PATH) return;
@@ -1379,5 +1455,8 @@ server.listen(PORT, () => {
   pollDealerProfile();
   setInterval(pollDealerProfile, CFG.optionsPollMs); // refresh dealer profile cadence
   setInterval(maybeEmitMoveAlert, 5_000); // evaluate alert engine every 5s
+
+  // 1Hz dashboard state stream (real inputs, no extra API calls)
+  setInterval(broadcastState, CFG.stateBroadcastMs);
 });
 

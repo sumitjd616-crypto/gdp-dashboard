@@ -325,6 +325,18 @@ class MassiveService {
         if (this.data.alerts.length > 200) this.data.alerts.pop();
         this.saveSession();
         this.onDataUpdate?.('alert', messages.data?.type || 'ALERT', messages.data);
+        return;
+      }
+
+      if (messages.type === 'STATE') {
+        const d = messages.data || {};
+        if (d.SPX) this.data.SPX = d.SPX;
+        if (d.VIX) this.data.VIX = d.VIX;
+        if (d.SPY) this.data.SPY = d.SPY;
+        if (d.bars) this.data.bars = d.bars;
+        if (d.dealer) this.data.dealer = d.dealer;
+        if (Array.isArray(d.alerts)) this.data.alerts = d.alerts;
+        this.onDataUpdate?.('state', 'STATE', this.data);
       }
     };
 
