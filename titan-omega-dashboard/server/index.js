@@ -119,22 +119,25 @@ const latest = {
     lastSPXBarTs: null,
     lastVIXBarTs: null,
     counters: { msgs: 0, spx: 0, vix: 0, spxBars: 0, vixBars: 0 },
-    countersStocks: { msgs: 0, spy: 0, spyBars: 0 },
+    countersStocks: { msgs: 0, spy: 0, spyBars: 0, qqq: 0, qqqBars: 0 },
     options: {
       connected: false,
       authenticated: false,
       lastMessageTs: null,
       lastTradeTs: null,
-      counters: { msgs: 0, trades: 0 },
+      lastQuoteTs: null,
+      counters: { msgs: 0, trades: 0, quotes: 0 },
     },
   },
   SPX: null,
   VIX: null,
   SPY: null,
+  QQQ: null,
   bars: {
     SPX: [], // newest-first, minute bars from AM.I:SPX
     VIX: [], // newest-first, minute bars from AM.I:VIX (if available)
     SPY: [], // newest-first, minute bars from AM.SPY
+    QQQ: [], // newest-first, minute bars from AM.QQQ
   },
   dealer: {
     spx: {
@@ -171,6 +174,23 @@ const latest = {
       weekly: null,
       blend: null,
     },
+    qqq: {
+      available: false,
+      reason: 'not_loaded',
+      timestamp: null,
+      underlying: 'QQQ',
+      expirations: { d0: null, weekly: null },
+      contracts: 0,
+      spot: null,
+      vix: null,
+      net: { gex: null, vanna: null, charm: null },
+      levels: { gammaFlip: null, callWall: null, putWall: null },
+      perStrike: [],
+      changes: null,
+      d0: null,
+      weekly: null,
+      blend: null,
+    },
     sync: {
       available: false,
       timestamp: null,
@@ -190,7 +210,19 @@ const latest = {
       // These are *flows*, not OI, and are used to detect rapid positioning changes.
       spx: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
       spy: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
+      qqq: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
       lastTradeTs: null,
+      computedAtTs: null,
+      notes: [],
+    },
+    quotes: {
+      available: false,
+      timestamp: null,
+      windowSec: 15,
+      spx: { avgIv: null, skew: null, ivRoc: null, sample: 0 },
+      spy: { avgIv: null, skew: null, ivRoc: null, sample: 0 },
+      qqq: { avgIv: null, skew: null, ivRoc: null, sample: 0 },
+      lastQuoteTs: null,
       computedAtTs: null,
       notes: [],
     },
@@ -204,11 +236,14 @@ function computeRealtimeDealerPulse() {
   const now = Date.now();
   const spxSpot = Number(latest.SPX?.price) || null;
   const spySpot = Number(latest.SPY?.price) || null;
+  const qqqSpot = Number(latest.QQQ?.price) || null;
 
   const spxBlend = latest.dealer?.spx?.blend?.available ? latest.dealer.spx.blend : null;
   const spyBlend = latest.dealer?.spy?.blend?.available ? latest.dealer.spy.blend : null;
+  const qqqBlend = latest.dealer?.qqq?.blend?.available ? latest.dealer.qqq.blend : null;
 
   const flow = latest.dealer?.flow?.available ? latest.dealer.flow : null;
+  const quotes = latest.dealer?.quotes?.available ? latest.dealer.quotes : null;
 
   const pulse = {
     timestamp: new Date().toISOString(),
@@ -241,13 +276,31 @@ function computeRealtimeDealerPulse() {
       flowTrades: flow?.spy?.trades ?? null,
       impulse: flow?.spy?.gammaNotional != null ? (flow.spy.gammaNotional < 0 ? 'BUY_IMPULSE' : flow.spy.gammaNotional > 0 ? 'SELL_IMPULSE' : 'NEUTRAL') : 'UNKNOWN',
     },
+    qqq: {
+      spot: qqqSpot,
+      flip: qqqBlend?.levels?.gammaFlip ?? null,
+      callWall: qqqBlend?.levels?.callWall ?? null,
+      putWall: qqqBlend?.levels?.putWall ?? null,
+      netGEX: qqqBlend?.net?.gex ?? null,
+      flowGammaNotional: flow?.qqq?.gammaNotional ?? null,
+      flowDeltaNotional: flow?.qqq?.deltaNotional ?? null,
+      flowTrades: flow?.qqq?.trades ?? null,
+      impulse: flow?.qqq?.gammaNotional != null ? (flow.qqq.gammaNotional < 0 ? 'BUY_IMPULSE' : flow.qqq.gammaNotional > 0 ? 'SELL_IMPULSE' : 'NEUTRAL') : 'UNKNOWN',
+      avgIv: quotes?.qqq?.avgIv ?? null,
+      ivRoc: quotes?.qqq?.ivRoc ?? null,
+      skew: quotes?.qqq?.skew ?? null,
+    },
     sync: latest.dealer?.sync ?? null,
+    sync3: latest.dealer?.sync3 ?? null,
     freshness: {
       spxTickMs: latest.status.lastSPXTs ? now - Number(latest.status.lastSPXTs) : null,
       spyTickMs: latest.SPY?.timestamp ? now - Number(latest.SPY.timestamp) : null,
+      qqqTickMs: latest.QQQ?.timestamp ? now - Number(latest.QQQ.timestamp) : null,
       flowMs: latest.dealer?.flow?.timestamp ? now - Date.parse(latest.dealer.flow.timestamp) : null,
+      quoteMs: latest.dealer?.quotes?.timestamp ? now - Date.parse(latest.dealer.quotes.timestamp) : null,
       spxSnapshotMs: spxBlend?.timestamp ? now - Date.parse(spxBlend.timestamp) : null,
       spySnapshotMs: spyBlend?.timestamp ? now - Date.parse(spyBlend.timestamp) : null,
+      qqqSnapshotMs: qqqBlend?.timestamp ? now - Date.parse(qqqBlend.timestamp) : null,
     },
   };
 
@@ -265,6 +318,7 @@ function broadcastState() {
       SPX: latest.SPX,
       VIX: latest.VIX,
       SPY: latest.SPY,
+      QQQ: latest.QQQ,
       bars: latest.bars,
       dealer: latest.dealer,
       alerts: latest.alerts,
@@ -446,16 +500,18 @@ app.get('/api/prev', async (_req, res) => {
   if (!requireToken(_req, res)) return;
   if (!API_KEY) return res.status(400).json({ ok: false, error: 'Missing server API key (set MASSIVE_API_KEY)' });
   try {
-    const [spx, vix, spy] = await Promise.all([
+    const [spx, vix, spy, qqq] = await Promise.all([
       fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/I:SPX/prev?apiKey=${encodeURIComponent(API_KEY)}`),
       fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/I:VIX/prev?apiKey=${encodeURIComponent(API_KEY)}`),
       fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/SPY/prev?apiKey=${encodeURIComponent(API_KEY)}`),
+      fetchJson(`${REST_BASE_URL}/v2/aggs/ticker/QQQ/prev?apiKey=${encodeURIComponent(API_KEY)}`),
     ]);
     res.json({
       ok: true,
       spx: spx?.results?.[0] || null,
       vix: vix?.results?.[0] || null,
       spy: spy?.results?.[0] || null,
+      qqq: qqq?.results?.[0] || null,
     });
   } catch (e) {
     res.status(502).json({ ok: false, error: String(e?.message || e) });
@@ -677,7 +733,7 @@ function connectUpstreamStocks() {
       if (msg?.ev === 'status') {
         if (msg.status === 'auth_success') {
           upstreamStocksAuthed = true;
-          upstreamStocks.send(JSON.stringify({ action: 'subscribe', params: 'T.SPY,AM.SPY' }));
+          upstreamStocks.send(JSON.stringify({ action: 'subscribe', params: 'T.SPY,AM.SPY,T.QQQ,AM.QQQ' }));
         }
         continue;
       }
@@ -687,6 +743,12 @@ function connectUpstreamStocks() {
         latest.status.countersStocks.spy += 1;
         latest.SPY = { price: msg.p, timestamp: msg.t || Date.now(), source: 'WS_T' };
         wsBroadcast(wss, { type: 'SPY', data: latest.SPY });
+      }
+
+      if (msg?.ev === 'T' && msg.sym === 'QQQ') {
+        latest.status.countersStocks.qqq += 1;
+        latest.QQQ = { price: msg.p, timestamp: msg.t || Date.now(), source: 'WS_T' };
+        wsBroadcast(wss, { type: 'QQQ', data: latest.QQQ });
       }
 
       if (msg?.ev === 'AM' && msg.sym === 'SPY') {
@@ -705,6 +767,24 @@ function connectUpstreamStocks() {
         latest.SPY = { price: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
         wsBroadcast(wss, { type: 'SPY', data: latest.SPY });
         wsBroadcast(wss, { type: 'SPY_BAR', data: bar });
+      }
+
+      if (msg?.ev === 'AM' && msg.sym === 'QQQ') {
+        latest.status.countersStocks.qqqBars += 1;
+        const bar = {
+          timestamp: msg.s || Date.now(),
+          open: msg.o,
+          high: msg.h,
+          low: msg.l,
+          close: msg.c,
+          volume: msg.v,
+          source: 'WS_AM',
+        };
+        latest.bars.QQQ.unshift(bar);
+        if (latest.bars.QQQ.length > 500) latest.bars.QQQ.pop();
+        latest.QQQ = { price: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
+        wsBroadcast(wss, { type: 'QQQ', data: latest.QQQ });
+        wsBroadcast(wss, { type: 'QQQ_BAR', data: bar });
       }
     }
   });
@@ -734,9 +814,11 @@ function scheduleReconnectStocks() {
 //   gammaNotional += dealerSignedGamma * size * 100 * underlyingPrice^2
 //
 // Dealer sign convention matches the rest: calls negative, puts positive.
-const optionGreeksByTicker = new Map(); // ticker -> { delta, gamma, type, underlying }
+const optionGreeksByTicker = new Map(); // ticker -> { delta, gamma, type, underlying, strike, expiration }
 const optionFlowEvents = []; // [{ ts, underlying, deltaNotional, gammaNotional }]
 let currentOptionSubs = new Set();
+const optionQuoteByTicker = new Map(); // ticker -> { bid, ask, mid, ts, iv }
+const quoteAggHistory = new Map(); // underlying -> [{ ts, avgIv, skew }]
 
 function pruneFlow(windowMs) {
   const cutoff = Date.now() - windowMs;
@@ -751,18 +833,118 @@ function recomputeFlow(windowSec = 30) {
     windowSec,
     spx: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
     spy: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
+    qqq: { deltaNotional: 0, gammaNotional: 0, trades: 0 },
     lastTradeTs: latest.status.options.lastTradeTs,
     computedAtTs: Date.now(),
     notes: [],
   };
   for (const e of optionFlowEvents) {
-    const bucket = e.underlying === 'SPX' ? agg.spx : e.underlying === 'SPY' ? agg.spy : null;
+    const bucket = e.underlying === 'SPX' ? agg.spx : e.underlying === 'SPY' ? agg.spy : e.underlying === 'QQQ' ? agg.qqq : null;
     if (!bucket) continue;
     bucket.deltaNotional += e.deltaNotional;
     bucket.gammaNotional += e.gammaNotional;
     bucket.trades += 1;
   }
   latest.dealer.flow = agg;
+}
+
+function bsPrice({ spot, strike, tteYears, iv, r = 0.05, type }) {
+  if (!spot || !strike || !tteYears || tteYears <= 0 || !iv || iv <= 0) return null;
+  const sqrtT = Math.sqrt(tteYears);
+  const d1 = (Math.log(spot / strike) + (r + 0.5 * iv * iv) * tteYears) / (iv * sqrtT);
+  const d2 = d1 - iv * sqrtT;
+  const df = Math.exp(-r * tteYears);
+  if (type === 'call') return spot * normalCDF(d1) - strike * df * normalCDF(d2);
+  return strike * df * normalCDF(-d2) - spot * normalCDF(-d1);
+}
+
+function solveIvMid({ spot, strike, tteYears, mid, type }) {
+  if (!Number.isFinite(spot) || !Number.isFinite(strike) || !Number.isFinite(tteYears) || tteYears <= 0 || !Number.isFinite(mid) || mid <= 0) return null;
+  const intrinsic = type === 'call' ? Math.max(0, spot - strike) : Math.max(0, strike - spot);
+  if (mid <= intrinsic + 1e-6) return 0.01;
+
+  let lo = 0.01;
+  let hi = 5.0;
+  for (let i = 0; i < 30; i += 1) {
+    const pHi = bsPrice({ spot, strike, tteYears, iv: hi, type });
+    if (pHi != null && pHi >= mid) break;
+    hi *= 1.5;
+    if (hi > 10) return null;
+  }
+  for (let i = 0; i < 40; i += 1) {
+    const midIv = (lo + hi) / 2;
+    const p = bsPrice({ spot, strike, tteYears, iv: midIv, type });
+    if (p == null) return null;
+    if (p > mid) hi = midIv;
+    else lo = midIv;
+  }
+  return (lo + hi) / 2;
+}
+
+function pruneQuoteHistory(underlying, windowMs) {
+  const arr = quoteAggHistory.get(underlying) || [];
+  const cutoff = Date.now() - windowMs;
+  while (arr.length && arr[0].ts < cutoff) arr.shift();
+  quoteAggHistory.set(underlying, arr);
+}
+
+function recomputeQuotes(windowSec = 15) {
+  const now = Date.now();
+  const windowMs = windowSec * 1000;
+  const out = {
+    available: upstreamOptionsAuthed,
+    timestamp: new Date().toISOString(),
+    windowSec,
+    spx: { avgIv: null, skew: null, ivRoc: null, sample: 0 },
+    spy: { avgIv: null, skew: null, ivRoc: null, sample: 0 },
+    qqq: { avgIv: null, skew: null, ivRoc: null, sample: 0 },
+    lastQuoteTs: latest.status.options.lastQuoteTs,
+    computedAtTs: now,
+    notes: [],
+  };
+
+  const perUnder = new Map(); // underlying -> { call: [iv], put: [iv] }
+  for (const [ticker, q] of optionQuoteByTicker) {
+    if (!q?.ts || now - q.ts > windowMs) continue;
+    const meta = optionGreeksByTicker.get(ticker);
+    if (!meta?.underlying || !Number.isFinite(q.iv)) continue;
+    if (!perUnder.has(meta.underlying)) perUnder.set(meta.underlying, { call: [], put: [] });
+    const b = perUnder.get(meta.underlying);
+    (meta.type === 'call' ? b.call : b.put).push(q.iv);
+  }
+
+  const calc = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  for (const under of ['SPX', 'SPY', 'QQQ']) {
+    const b = perUnder.get(under);
+    if (!b) continue;
+    const callIv = calc(b.call);
+    const putIv = calc(b.put);
+    const avgIv = calc([...b.call, ...b.put]);
+    const skew = callIv != null && putIv != null ? putIv - callIv : null;
+
+    pruneQuoteHistory(under, 5 * 60 * 1000);
+    const hist = quoteAggHistory.get(under) || [];
+    hist.push({ ts: now, avgIv: avgIv ?? null, skew: skew ?? null });
+    quoteAggHistory.set(under, hist);
+
+    // ROC vs ~windowSec ago
+    let past = null;
+    for (let i = hist.length - 1; i >= 0; i -= 1) {
+      if (now - hist[i].ts >= windowMs) {
+        past = hist[i];
+        break;
+      }
+    }
+    const ivRoc = avgIv != null && past?.avgIv != null ? avgIv - past.avgIv : null;
+
+    const tgt = under === 'SPX' ? out.spx : under === 'SPY' ? out.spy : out.qqq;
+    tgt.avgIv = avgIv;
+    tgt.skew = skew;
+    tgt.ivRoc = ivRoc;
+    tgt.sample = (b.call.length || 0) + (b.put.length || 0);
+  }
+
+  latest.dealer.quotes = out;
 }
 
 function connectUpstreamOptions() {
@@ -821,7 +1003,7 @@ function connectUpstreamOptions() {
         latest.status.options.lastTradeTs = ts;
 
         const under = g.underlying;
-        const spot = under === 'SPX' ? Number(latest.SPX?.price) : under === 'SPY' ? Number(latest.SPY?.price) : null;
+        const spot = under === 'SPX' ? Number(latest.SPX?.price) : under === 'SPY' ? Number(latest.SPY?.price) : under === 'QQQ' ? Number(latest.QQQ?.price) : null;
         if (!spot) continue;
 
         const delta = Number(g.delta || 0);
@@ -835,6 +1017,33 @@ function connectUpstreamOptions() {
         pruneFlow((latest.dealer.flow.windowSec || 30) * 1000);
         recomputeFlow(latest.dealer.flow.windowSec || 30);
         wsBroadcast(wss, { type: 'DEALER_FLOW', data: latest.dealer.flow });
+      }
+
+      // Options quotes: Polygon options socket uses ev:'Q' (best bid/ask)
+      if ((msg?.ev === 'Q' || msg?.ev === 'QUOTE') && msg.sym && String(msg.sym).startsWith('O:')) {
+        latest.status.options.counters.quotes += 1;
+        const ticker = String(msg.sym);
+        const meta = optionGreeksByTicker.get(ticker);
+        if (!meta) continue;
+
+        const ts = Number(msg.t || Date.now());
+        latest.status.options.lastQuoteTs = ts;
+
+        const bid = Number(msg.bp ?? msg.b ?? msg.bid ?? NaN);
+        const ask = Number(msg.ap ?? msg.a ?? msg.ask ?? NaN);
+        if (!Number.isFinite(bid) || !Number.isFinite(ask) || ask <= 0 || bid < 0) continue;
+        const mid = (bid + ask) / 2;
+
+        const under = meta.underlying;
+        const spot = under === 'SPX' ? Number(latest.SPX?.price) : under === 'SPY' ? Number(latest.SPY?.price) : under === 'QQQ' ? Number(latest.QQQ?.price) : null;
+        if (!Number.isFinite(spot)) continue;
+
+        const now = Date.now();
+        const expMs = meta.expiration ? new Date(`${meta.expiration}T16:00:00-04:00`).getTime() : null;
+        const tteYears = expMs ? Math.max(1 / 365, (expMs - now) / (365 * 24 * 60 * 60 * 1000)) : 7 / 365;
+        const iv = solveIvMid({ spot, strike: meta.strike, tteYears, mid, type: meta.type });
+
+        optionQuoteByTicker.set(ticker, { bid, ask, mid, ts, iv });
       }
     }
   });
@@ -1093,6 +1302,7 @@ function blendProfiles(p0, pw, weights = { d0: 0.65, weekly: 0.35 }) {
 
 let lastDealerSPX = null;
 let lastDealerSPY = null;
+let lastDealerQQQ = null;
 
 function computeSync() {
   const notes = [];
@@ -1157,6 +1367,47 @@ function computeSync() {
   };
 }
 
+function computeSync3() {
+  const notes = [];
+  const spx = latest.dealer.spx?.blend?.available ? latest.dealer.spx.blend : null;
+  const spy = latest.dealer.spy?.blend?.available ? latest.dealer.spy.blend : null;
+  const qqq = latest.dealer.qqq?.blend?.available ? latest.dealer.qqq.blend : null;
+
+  const signs = [
+    spx ? Math.sign(spx.net?.gex || 0) : 0,
+    spy ? Math.sign(spy.net?.gex || 0) : 0,
+    qqq ? Math.sign(qqq.net?.gex || 0) : 0,
+  ].filter((x) => x !== 0);
+
+  if (!signs.length) {
+    latest.dealer.sync3 = { available: false, timestamp: new Date().toISOString(), agreement: null, notes: ['Waiting for dealer snapshots'] };
+    return;
+  }
+
+  const allSame = signs.every((x) => x === signs[0]);
+  let agreement = 50;
+  if (allSame && signs.length >= 2) {
+    agreement = 85;
+    notes.push('SPX/SPY/QQQ dealer gamma align (same sign)');
+  } else if (signs.length >= 2) {
+    agreement = 45;
+    notes.push('Dealer gamma alignment mixed across SPX/SPY/QQQ');
+  }
+
+  // Boost if quotes layer agrees (IV ROC in same direction across underlyings)
+  const q = latest.dealer.quotes;
+  const ivRocs = [q?.spx?.ivRoc, q?.spy?.ivRoc, q?.qqq?.ivRoc].filter((v) => Number.isFinite(v));
+  if (ivRocs.length >= 2) {
+    const s = ivRocs.map((v) => Math.sign(v)).filter((x) => x !== 0);
+    if (s.length >= 2 && s.every((x) => x === s[0])) {
+      agreement = Math.min(100, agreement + 10);
+      notes.push('IV ROC alignment across underlyings (quotes)');
+    }
+  }
+
+  latest.dealer.sync3 = { available: true, timestamp: new Date().toISOString(), agreement, notes };
+}
+
 async function pollDealerProfile() {
   if (!API_KEY) return;
   try {
@@ -1165,9 +1416,14 @@ async function pollDealerProfile() {
 
     const spxSpot = Number(latest.SPX?.price);
     const spySpot = Number(latest.SPY?.price);
+    const qqqSpot = Number(latest.QQQ?.price);
     const vix = Number(latest.VIX?.value);
 
-    const [spxContracts, spyContracts] = await Promise.all([fetchOptionsSnapshot('SPX'), fetchOptionsSnapshot('SPY')]);
+    const [spxContracts, spyContracts, qqqContracts] = await Promise.all([
+      fetchOptionsSnapshot('SPX'),
+      fetchOptionsSnapshot('SPY'),
+      fetchOptionsSnapshot('QQQ'),
+    ]);
 
     // SPX profile
     if (!spxSpot) {
@@ -1245,8 +1501,50 @@ async function pollDealerProfile() {
       wsBroadcast(wss, { type: 'DEALER_PROFILE_SPY', data: composite });
     }
 
+    // QQQ profile
+    if (!qqqSpot) {
+      latest.dealer.qqq = { ...latest.dealer.qqq, available: false, reason: 'no_qqq_spot_yet', timestamp: new Date().toISOString() };
+    } else if (!qqqContracts.length) {
+      latest.dealer.qqq = { ...latest.dealer.qqq, available: false, reason: 'no_qqq_contracts', timestamp: new Date().toISOString() };
+    } else {
+      const exps = pickExpiryBlend(qqqContracts);
+      const d0 = exps.d0 ? computeDealerProfile({ spot: qqqSpot, vix, contracts: qqqContracts, expiration: exps.d0, underlying: 'QQQ' }) : null;
+      const wk = exps.weekly ? computeDealerProfile({ spot: qqqSpot, vix, contracts: qqqContracts, expiration: exps.weekly, underlying: 'QQQ' }) : null;
+      const blend = blendProfiles(d0, wk);
+
+      const composite = {
+        available: Boolean(blend?.available),
+        reason: blend?.available ? null : blend?.reason || 'unavailable',
+        timestamp: new Date().toISOString(),
+        underlying: 'QQQ',
+        spot: qqqSpot,
+        vix,
+        expirations: exps,
+        d0,
+        weekly: wk,
+        blend,
+      };
+
+      if (lastDealerQQQ?.blend?.available && composite.blend?.available) {
+        composite.changes = {
+          netGEX: composite.blend.net.gex - lastDealerQQQ.blend.net.gex,
+          netVanna: composite.blend.net.vanna - lastDealerQQQ.blend.net.vanna,
+          netCharm: composite.blend.net.charm - lastDealerQQQ.blend.net.charm,
+          gammaFlip: (composite.blend.levels.gammaFlip ?? 0) - (lastDealerQQQ.blend.levels.gammaFlip ?? 0),
+        };
+      }
+
+      lastDealerQQQ = composite;
+      latest.dealer.qqq = composite;
+      wsBroadcast(wss, { type: 'DEALER_PROFILE_QQQ', data: composite });
+    }
+
     computeSync();
+    recomputeQuotes(CFG.flowWindowSec);
+    computeSync3();
     wsBroadcast(wss, { type: 'DEALER_SYNC', data: latest.dealer.sync });
+    wsBroadcast(wss, { type: 'DEALER_SYNC3', data: latest.dealer.sync3 });
+    wsBroadcast(wss, { type: 'DEALER_QUOTES', data: latest.dealer.quotes });
 
     // Update options WS subscriptions to track seconds-level flow around ATM for 0DTE+weekly.
     // We only subscribe to a limited set to keep it efficient.
@@ -1264,7 +1562,7 @@ async function pollDealerProfile() {
 
       // Use snapshot contracts to map tickers -> greeks; prefer 0DTE + weekly expirations.
       const expirations = [composite.expirations?.d0, composite.expirations?.weekly].filter(Boolean);
-      const contracts = underlying === 'SPX' ? spxContracts : spyContracts;
+      const contracts = underlying === 'SPX' ? spxContracts : underlying === 'SPY' ? spyContracts : qqqContracts;
 
       // Build a quick index: strike+type+exp -> ticker+greeks
       for (const c of contracts) {
@@ -1283,19 +1581,26 @@ async function pollDealerProfile() {
           gamma: Number(c.greeks?.gamma || 0),
           type,
           underlying,
+          strike,
+          expiration: d.expiration_date,
         });
       }
 
       // Subscribe to tickers we have greeks for
-      for (const [ticker, g] of optionGreeksByTicker) {
-        if (g.underlying !== underlying) continue;
-        // Options WS uses trade channel "T.<ticker>"
+      const tickers = Array.from(optionGreeksByTicker.entries())
+        .filter(([, g]) => g.underlying === underlying)
+        .sort((a, b) => Math.abs((a[1].strike || 0) - spotPx) - Math.abs((b[1].strike || 0) - spotPx))
+        .slice(0, 30);
+      for (const [ticker] of tickers) {
+        // Options WS: trades + quotes
         subTickers.add(`T.${ticker}`);
+        subTickers.add(`Q.${ticker}`);
       }
     };
 
     if (latest.dealer.spx?.available) addSubs(latest.dealer.spx, 'SPX');
     if (latest.dealer.spy?.available) addSubs(latest.dealer.spy, 'SPY');
+    if (latest.dealer.qqq?.available) addSubs(latest.dealer.qqq, 'QQQ');
 
     // Apply new subscriptions (diff)
     const next = subTickers;
@@ -1311,6 +1616,7 @@ async function pollDealerProfile() {
     latest.dealer.spx = { ...latest.dealer.spx, available: false, reason: String(e?.message || e), timestamp: new Date().toISOString() };
     latest.dealer.spy = { ...latest.dealer.spy, available: false, reason: String(e?.message || e), timestamp: new Date().toISOString() };
     computeSync();
+    computeSync3();
   }
 }
 
@@ -1377,6 +1683,30 @@ function scoreMove15({ spot, bars, dealer }) {
     if ((dealer.sync.agreement || 0) >= 75) {
       score += 5;
       reasons.push('High SPX↔SPY dealer agreement');
+    }
+  }
+
+  // QQQ confirmation (adds confidence, especially on macro vs tech dominance days)
+  if (dealer.qqq?.blend?.available) {
+    const s1 = Math.sign(dealer.spx.blend.net.gex || 0);
+    const s3 = Math.sign(dealer.qqq.blend.net.gex || 0);
+    if (s1 !== 0 && s3 !== 0 && s1 === s3) {
+      score += 6;
+      reasons.push('QQQ options confirm SPX gamma sign');
+    }
+  }
+
+  // Options quotes (IV ROC) as early warning: rising IV with downside momentum, or falling IV with upside momentum
+  if (dealer.quotes?.available) {
+    const ivRoc = Number(dealer.quotes?.spx?.ivRoc);
+    if (Number.isFinite(ivRoc)) {
+      if (direction === 'DOWN' && ivRoc > 0) {
+        score += 6;
+        reasons.push('SPX IV rising (quotes) with downside momentum');
+      } else if (direction === 'UP' && ivRoc < 0) {
+        score += 4;
+        reasons.push('SPX IV easing (quotes) with upside momentum');
+      }
     }
   }
 
@@ -1462,8 +1792,8 @@ function maybeEmitMoveAlert() {
   const barFresh = latest.status.lastSPXBarTs ? now - Number(latest.status.lastSPXBarTs) < CFG.barFreshMs : false;
   const tickFresh = latest.status.lastSPXTs ? now - Number(latest.status.lastSPXTs) < CFG.tickFreshMs : false;
   const flowFresh = dealer.flow?.timestamp ? now - Date.parse(dealer.flow.timestamp) < CFG.flowFreshMs : false;
-  const agreement = Number(dealer.sync?.agreement || 0);
-  const okAgreement = !dealer.sync?.available || agreement >= CFG.minAgreement;
+  const agreement = Number(dealer.sync3?.agreement ?? dealer.sync?.agreement ?? 0);
+  const okAgreement = (!dealer.sync3?.available && !dealer.sync?.available) || agreement >= CFG.minAgreement;
   const okSession = isRthNowET(now);
 
   // Discipline: TRIGGER requires seconds-level freshness (tick + flow) and a reasonably fresh dealer snapshot.
@@ -1506,6 +1836,8 @@ server.listen(PORT, () => {
   setInterval(() => {
     latest.dealer.flow.windowSec = CFG.flowWindowSec;
     recomputeFlow(CFG.flowWindowSec);
+    recomputeQuotes(CFG.flowWindowSec);
+    computeSync3();
   }, 1000);
 });
 
