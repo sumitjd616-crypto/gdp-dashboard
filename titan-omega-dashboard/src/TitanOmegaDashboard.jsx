@@ -41,6 +41,7 @@ export default function TitanOmegaDashboard() {
   const [spx, setSpx] = useState(null);
   const [vix, setVix] = useState(null);
   const [spy, setSpy] = useState(null);
+  const [qqq, setQqq] = useState(null);
   const [dailyBars, setDailyBars] = useState([]);
   const [spxBars, setSpxBars] = useState([]);
   const [alerts, setAlerts] = useState([]);
@@ -61,10 +62,12 @@ export default function TitanOmegaDashboard() {
       const cached = JSON.parse(raw);
       if (cached?.data?.SPX && !spx) setSpx(cached.data.SPX);
       if (cached?.data?.VIX && !vix) setVix(cached.data.VIX);
+      if (cached?.data?.SPY && !spy) setSpy(cached.data.SPY);
+      if (cached?.data?.QQQ && !qqq) setQqq(cached.data.QQQ);
     } catch {
       // ignore
     }
-  }, [spx, vix]);
+  }, [spx, vix, spy, qqq]);
 
   // Clock
   useEffect(() => {
@@ -95,6 +98,7 @@ export default function TitanOmegaDashboard() {
         if (data?.SPX) setSpx(data.SPX);
         if (data?.VIX) setVix(data.VIX);
         if (data?.SPY) setSpy(data.SPY);
+        if (data?.QQQ) setQqq(data.QQQ);
         if (data?.bars?.SPX && Array.isArray(data.bars.SPX)) setSpxBars(data.bars.SPX);
         if (Array.isArray(data?.alerts)) setAlerts(data.alerts);
         if (data?.dealer) setDealer(data.dealer);
@@ -127,6 +131,7 @@ export default function TitanOmegaDashboard() {
   const spot = spx?.price ? Number(spx.price) : null;
   const vixVal = vix?.value ? Number(vix.value) : null;
   const spyPx = spy?.price ? Number(spy.price) : null;
+  const qqqPx = qqq?.price ? Number(qqq.price) : null;
 
   const gex = useMemo(() => {
     if (!spot || !spxBars.length) return null;
@@ -171,6 +176,9 @@ export default function TitanOmegaDashboard() {
   const spxAge = ageSec(dataStatus.lastSPXTs);
   const vixAge = ageSec(dataStatus.lastVIXTs);
   const spxBarAge = ageSec(dataStatus.lastSPXBarTs);
+  const spyAge = ageSec(spy?.timestamp);
+  const qqqAge = ageSec(qqq?.timestamp);
+  const quoteAge = dealer?.pulse?.freshness?.quoteMs != null ? Math.max(0, Math.floor(Number(dealer.pulse.freshness.quoteMs) / 1000)) : null;
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 font-sans">
@@ -201,6 +209,11 @@ export default function TitanOmegaDashboard() {
               <div className="text-xs text-gray-500">SPY</div>
               <div className="text-xl font-mono">{spyPx ? spyPx.toFixed(2) : '—'}</div>
               <div className="text-xs text-gray-600">{spy?.timestamp ? formatETTime(new Date(spy.timestamp)) : ''} ET</div>
+            </div>
+            <div className="text-center">
+              <div className="text-xs text-gray-500">QQQ</div>
+              <div className="text-xl font-mono">{qqqPx ? qqqPx.toFixed(2) : '—'}</div>
+              <div className="text-xs text-gray-600">{qqq?.timestamp ? formatETTime(new Date(qqq.timestamp)) : ''} ET</div>
             </div>
             {gex && (
               <div className="flex items-center gap-2">
@@ -249,6 +262,14 @@ export default function TitanOmegaDashboard() {
                 <div className="font-mono font-bold">{vixAge == null ? '—' : `${vixAge}s`}</div>
               </div>
               <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                <div className="text-gray-500">SPY tick age</div>
+                <div className="font-mono font-bold">{spyAge == null ? '—' : `${spyAge}s`}</div>
+              </div>
+              <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                <div className="text-gray-500">QQQ tick age</div>
+                <div className="font-mono font-bold">{qqqAge == null ? '—' : `${qqqAge}s`}</div>
+              </div>
+              <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
                 <div className="text-gray-500">SPX bar age</div>
                 <div className="font-mono font-bold">{spxBarAge == null ? '—' : `${spxBarAge}s`}</div>
               </div>
@@ -256,37 +277,55 @@ export default function TitanOmegaDashboard() {
                 <div className="text-gray-500">SPX bars cached</div>
                 <div className="font-mono font-bold">{spxBars.length}</div>
               </div>
+              <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2 col-span-2">
+                <div className="text-gray-500">Options quotes age</div>
+                <div className="font-mono font-bold">{quoteAge == null ? '—' : `${quoteAge}s`}</div>
+              </div>
             </div>
           </div>
 
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
             <div className="flex items-center justify-between mb-2">
               <div className="text-sm font-semibold text-gray-300">Dealer positioning (real options)</div>
-              <Badge color={dealer?.spx?.available || dealer?.spy?.available ? 'green' : 'yellow'}>
-                {dealer?.spx?.available || dealer?.spy?.available ? 'LIVE' : 'UNAVAILABLE'}
+              <Badge color={dealer?.spx?.blend?.available || dealer?.spy?.blend?.available || dealer?.qqq?.blend?.available ? 'green' : 'yellow'}>
+                {dealer?.spx?.blend?.available || dealer?.spy?.blend?.available || dealer?.qqq?.blend?.available ? 'LIVE' : 'UNAVAILABLE'}
               </Badge>
             </div>
-            {!dealer?.spx?.available && !dealer?.spy?.available && (
-              <div className="text-xs text-gray-400">Waiting for first SPX+SPY options snapshots…</div>
+            {!dealer?.spx?.blend?.available && !dealer?.spy?.blend?.available && !dealer?.qqq?.blend?.available && (
+              <div className="text-xs text-gray-400">Waiting for first SPX/SPY/QQQ options snapshots…</div>
             )}
 
-            {(dealer?.spx?.available || dealer?.spy?.available) && (
-              <div className="grid grid-cols-2 gap-2 text-xs">
+            {(dealer?.spx?.blend?.available || dealer?.spy?.blend?.available || dealer?.qqq?.blend?.available) && (
+              <div className="grid grid-cols-3 gap-2 text-xs">
                 <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
                   <div className="text-gray-500">SPX Net GEX</div>
-                  <div className="font-mono font-bold">{dealer?.spx?.available ? Number(dealer.spx.net?.gex || 0).toFixed(0) : '—'}</div>
+                  <div className="font-mono font-bold">
+                    {dealer?.spx?.blend?.available ? Number(dealer.spx.blend.net?.gex || 0).toFixed(0) : '—'}
+                  </div>
                 </div>
                 <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
                   <div className="text-gray-500">SPY Net GEX</div>
-                  <div className="font-mono font-bold">{dealer?.spy?.available ? Number(dealer.spy.net?.gex || 0).toFixed(0) : '—'}</div>
+                  <div className="font-mono font-bold">
+                    {dealer?.spy?.blend?.available ? Number(dealer.spy.blend.net?.gex || 0).toFixed(0) : '—'}
+                  </div>
+                </div>
+                <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                  <div className="text-gray-500">QQQ Net GEX</div>
+                  <div className="font-mono font-bold">
+                    {dealer?.qqq?.blend?.available ? Number(dealer.qqq.blend.net?.gex || 0).toFixed(0) : '—'}
+                  </div>
                 </div>
                 <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
                   <div className="text-gray-500">SPX γ-Flip</div>
-                  <div className="font-mono font-bold">{dealer?.spx?.available ? dealer.spx.levels?.gammaFlip ?? '—' : '—'}</div>
+                  <div className="font-mono font-bold">{dealer?.spx?.blend?.available ? dealer.spx.blend.levels?.gammaFlip ?? '—' : '—'}</div>
                 </div>
                 <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
                   <div className="text-gray-500">SPY γ-Flip</div>
-                  <div className="font-mono font-bold">{dealer?.spy?.available ? dealer.spy.levels?.gammaFlip ?? '—' : '—'}</div>
+                  <div className="font-mono font-bold">{dealer?.spy?.blend?.available ? dealer.spy.blend.levels?.gammaFlip ?? '—' : '—'}</div>
+                </div>
+                <div className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                  <div className="text-gray-500">QQQ γ-Flip</div>
+                  <div className="font-mono font-bold">{dealer?.qqq?.blend?.available ? dealer.qqq.blend.levels?.gammaFlip ?? '—' : '—'}</div>
                 </div>
               </div>
             )}
@@ -309,6 +348,18 @@ export default function TitanOmegaDashboard() {
               </div>
             )}
 
+            {dealer?.sync3?.available && (
+              <div className="mt-3 text-xs text-gray-400">
+                <div className="flex items-center justify-between">
+                  <span className="text-gray-500">SPX/SPY/QQQ confluence</span>
+                  <span className="font-mono font-bold">{dealer.sync3.agreement}</span>
+                </div>
+                {Array.isArray(dealer.sync3.notes) && dealer.sync3.notes.length > 0 && (
+                  <div className="text-gray-500 mt-1">{dealer.sync3.notes.slice(0, 2).join(' · ')}</div>
+                )}
+              </div>
+            )}
+
             {dealer?.flow?.available && (
               <div className="mt-3 text-xs text-gray-400">
                 <div className="flex items-center justify-between">
@@ -322,6 +373,35 @@ export default function TitanOmegaDashboard() {
                 <div className="flex items-center justify-between mt-1">
                   <span className="text-gray-500">SPY flow γNotional</span>
                   <span className="font-mono">{Number(dealer.flow.spy?.gammaNotional || 0).toFixed(0)}</span>
+                </div>
+                <div className="flex items-center justify-between mt-1">
+                  <span className="text-gray-500">QQQ flow γNotional</span>
+                  <span className="font-mono">{Number(dealer.flow.qqq?.gammaNotional || 0).toFixed(0)}</span>
+                </div>
+              </div>
+            )}
+
+            {dealer?.quotes?.available && (
+              <div className="mt-3 text-xs text-gray-400">
+                <div className="flex items-center justify-between">
+                  <span className="text-gray-500">Quotes window</span>
+                  <span className="font-mono">{dealer.quotes.windowSec}s</span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 mt-2">
+                  {[
+                    { k: 'SPX', q: dealer.quotes.spx },
+                    { k: 'SPY', q: dealer.quotes.spy },
+                    { k: 'QQQ', q: dealer.quotes.qqq },
+                  ].map(({ k, q }) => (
+                    <div key={k} className="bg-gray-950/40 border border-gray-800 rounded-lg p-2">
+                      <div className="text-gray-500">{k} IV / skew / ROC</div>
+                      <div className="font-mono">
+                        {(q?.avgIv != null ? (q.avgIv * 100).toFixed(1) : '—') + '%'} · {q?.skew != null ? (q.skew * 100).toFixed(1) : '—'} ·{' '}
+                        {q?.ivRoc != null ? (q.ivRoc * 100).toFixed(2) : '—'}
+                      </div>
+                      <div className="text-gray-600 mt-1">n={q?.sample ?? 0}</div>
+                    </div>
+                  ))}
                 </div>
               </div>
             )}

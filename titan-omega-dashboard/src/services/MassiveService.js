@@ -28,6 +28,7 @@ class MassiveService {
       SPX: null,
       VIX: null,
       SPY: null,
+      QQQ: null,
       bars: { SPX: [], VIX: [], SPY: [] },
       dealer: null,
       alerts: [],
@@ -159,6 +160,19 @@ class MassiveService {
       };
     }
 
+    const qqq = json?.qqq;
+    if (qqq?.c != null) {
+      this.data.QQQ = {
+        price: qqq.c,
+        open: qqq.o,
+        high: qqq.h,
+        low: qqq.l,
+        volume: qqq.v,
+        timestamp: new Date(qqq.t),
+        source: 'REST_PREV_DAY_PROXY',
+      };
+    }
+
     this.saveSession();
     return this.data;
   }
@@ -201,9 +215,11 @@ class MassiveService {
         if (snap.SPX) this.data.SPX = snap.SPX;
         if (snap.VIX) this.data.VIX = snap.VIX;
         if (snap.SPY) this.data.SPY = snap.SPY;
+        if (snap.QQQ) this.data.QQQ = snap.QQQ;
         if (snap.bars?.SPX && Array.isArray(snap.bars.SPX)) this.data.bars.SPX = snap.bars.SPX;
         if (snap.bars?.VIX && Array.isArray(snap.bars.VIX)) this.data.bars.VIX = snap.bars.VIX;
         if (snap.bars?.SPY && Array.isArray(snap.bars.SPY)) this.data.bars.SPY = snap.bars.SPY;
+        if (snap.bars?.QQQ && Array.isArray(snap.bars.QQQ)) this.data.bars.QQQ = snap.bars.QQQ;
         if (snap.dealer) this.data.dealer = snap.dealer;
         if (Array.isArray(snap.alerts)) this.data.alerts = snap.alerts;
         if (snap.status) {
@@ -269,6 +285,13 @@ class MassiveService {
         return;
       }
 
+      if (messages.type === 'QQQ') {
+        this.data.QQQ = { ...messages.data, source: messages.data?.source || 'WS_PROXY' };
+        this.saveSession();
+        this.onDataUpdate?.('index', 'QQQ', this.data);
+        return;
+      }
+
       if (messages.type === 'SPY_BAR') {
         const bar = messages.data;
         if (bar) {
@@ -277,6 +300,19 @@ class MassiveService {
           if (bar.close != null) this.data.SPY = { price: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
           this.saveSession();
           this.onDataUpdate?.('bar', 'SPY', bar);
+        }
+        return;
+      }
+
+      if (messages.type === 'QQQ_BAR') {
+        const bar = messages.data;
+        if (bar) {
+          if (!this.data.bars.QQQ) this.data.bars.QQQ = [];
+          this.data.bars.QQQ.unshift(bar);
+          if (this.data.bars.QQQ.length > 500) this.data.bars.QQQ.pop();
+          if (bar.close != null) this.data.QQQ = { price: bar.close, timestamp: bar.timestamp, source: 'WS_AM' };
+          this.saveSession();
+          this.onDataUpdate?.('bar', 'QQQ', bar);
         }
         return;
       }
@@ -304,6 +340,14 @@ class MassiveService {
         return;
       }
 
+      if (messages.type === 'DEALER_PROFILE_QQQ') {
+        if (!this.data.dealer) this.data.dealer = {};
+        this.data.dealer.qqq = messages.data;
+        this.saveSession();
+        this.onDataUpdate?.('dealer', 'QQQ', this.data);
+        return;
+      }
+
       if (messages.type === 'DEALER_SYNC') {
         if (!this.data.dealer) this.data.dealer = {};
         this.data.dealer.sync = messages.data;
@@ -312,11 +356,27 @@ class MassiveService {
         return;
       }
 
+      if (messages.type === 'DEALER_SYNC3') {
+        if (!this.data.dealer) this.data.dealer = {};
+        this.data.dealer.sync3 = messages.data;
+        this.saveSession();
+        this.onDataUpdate?.('dealer', 'SYNC3', this.data);
+        return;
+      }
+
       if (messages.type === 'DEALER_FLOW') {
         if (!this.data.dealer) this.data.dealer = {};
         this.data.dealer.flow = messages.data;
         this.saveSession();
         this.onDataUpdate?.('dealer', 'FLOW', this.data);
+        return;
+      }
+
+      if (messages.type === 'DEALER_QUOTES') {
+        if (!this.data.dealer) this.data.dealer = {};
+        this.data.dealer.quotes = messages.data;
+        this.saveSession();
+        this.onDataUpdate?.('dealer', 'QUOTES', this.data);
         return;
       }
 
@@ -333,6 +393,7 @@ class MassiveService {
         if (d.SPX) this.data.SPX = d.SPX;
         if (d.VIX) this.data.VIX = d.VIX;
         if (d.SPY) this.data.SPY = d.SPY;
+        if (d.QQQ) this.data.QQQ = d.QQQ;
         if (d.bars) this.data.bars = d.bars;
         if (d.dealer) this.data.dealer = d.dealer;
         if (Array.isArray(d.alerts)) this.data.alerts = d.alerts;
