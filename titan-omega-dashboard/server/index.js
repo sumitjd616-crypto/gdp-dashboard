@@ -47,6 +47,8 @@ const CFG = {
   triggerMinScore: Number(process.env.TRIGGER_MIN_SCORE || 65),
   headsUpCooldownMs: Number(process.env.HEADSUP_COOLDOWN_MS || 20_000),
   triggerCooldownMs: Number(process.env.TRIGGER_COOLDOWN_MS || 60_000),
+  maxTriggersPerDay: Number(process.env.MAX_TRIGGERS_PER_DAY || 26),
+  maxHeadsUpPerDay: Number(process.env.MAX_HEADSUP_PER_DAY || 250),
   minAgreement: Number(process.env.MIN_DEALER_AGREEMENT || 45),
   dealerFreshMs: Number(process.env.DEALER_FRESH_MS || 90_000),
   barFreshMs: Number(process.env.BAR_FRESH_MS || 120_000),
@@ -64,6 +66,35 @@ const CFG = {
 
 const app = express();
 const server = http.createServer(app);
+
+function etDateKey(tsMs) {
+  try {
+    const d = new Date(tsMs);
+    // YYYY-MM-DD in America/New_York
+    const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(d);
+    const y = parts.find((p) => p.type === 'year')?.value;
+    const m = parts.find((p) => p.type === 'month')?.value;
+    const day = parts.find((p) => p.type === 'day')?.value;
+    return `${y}-${m}-${day}`;
+  } catch {
+    return new Date(tsMs).toISOString().slice(0, 10);
+  }
+}
+
+const dailyBudget = {
+  dateET: etDateKey(Date.now()),
+  triggers: 0,
+  headsUp: 0,
+};
+
+function resetDailyBudgetIfNeeded(tsMs) {
+  const key = etDateKey(tsMs);
+  if (dailyBudget.dateET !== key) {
+    dailyBudget.dateET = key;
+    dailyBudget.triggers = 0;
+    dailyBudget.headsUp = 0;
+  }
+}
 
 // Latest snapshot cached in-memory (and served to new WS clients).
 const latest = {
@@ -1251,6 +1282,7 @@ function maybeEmitMoveAlert() {
   const s = scoreMove15({ spot, bars, dealer });
   const now = Date.now();
   if (!s) return;
+  resetDailyBudgetIfNeeded(now);
 
   const dealerPayload = {
     spx: dealer.spx?.blend?.available
@@ -1276,8 +1308,9 @@ function maybeEmitMoveAlert() {
   };
 
   // Tier 1: HEADS-UP (high recall, low spam)
-  if (s.headsUp && now - lastHeadsUpTs >= CFG.headsUpCooldownMs) {
+  if (s.headsUp && now - lastHeadsUpTs >= CFG.headsUpCooldownMs && dailyBudget.headsUp < CFG.maxHeadsUpPerDay) {
     lastHeadsUpTs = now;
+    dailyBudget.headsUp += 1;
     pushAlert({
       type: 'MOVE_15PT_HEADS_UP',
       tier: 'HEADS_UP',
@@ -1301,7 +1334,9 @@ function maybeEmitMoveAlert() {
 
   if (s.trigger && dealerFresh && barFresh && okAgreement && okSession) {
     if (now - lastAlertTs < CFG.triggerCooldownMs) return; // max trigger rate
+    if (dailyBudget.triggers >= CFG.maxTriggersPerDay) return;
     lastAlertTs = now;
+    dailyBudget.triggers += 1;
     pushAlert({
       type: 'MOVE_15PT_TRIGGER',
       tier: 'TRIGGER',
