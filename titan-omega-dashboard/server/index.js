@@ -50,8 +50,14 @@ const CFG = {
   maxTriggersPerDay: Number(process.env.MAX_TRIGGERS_PER_DAY || 26),
   maxHeadsUpPerDay: Number(process.env.MAX_HEADSUP_PER_DAY || 250),
   minAgreement: Number(process.env.MIN_DEALER_AGREEMENT || 45),
-  dealerFreshMs: Number(process.env.DEALER_FRESH_MS || 90_000),
-  barFreshMs: Number(process.env.BAR_FRESH_MS || 120_000),
+  // "Institutional speed" gating:
+  // - require tick freshness (seconds) for TRIGGER
+  // - require options-flow freshness (seconds) for TRIGGER
+  // - keep options snapshot freshness tighter than before
+  tickFreshMs: Number(process.env.TICK_FRESH_MS || 8_000),
+  flowFreshMs: Number(process.env.FLOW_FRESH_MS || 6_000),
+  dealerFreshMs: Number(process.env.DEALER_FRESH_MS || 45_000),
+  barFreshMs: Number(process.env.BAR_FRESH_MS || 150_000), // minute bars update slowly; don't over-gate
   // Risk model: structure + realized volatility (all from real price)
   stopMinPts: Number(process.env.STOP_MIN_PTS || 8),
   stopAtrMult: Number(process.env.STOP_ATR_MULT || 0.5),
@@ -62,6 +68,10 @@ const CFG = {
   tp3Pts: Number(process.env.TP3_PTS || 25),
   // Trade time-to-live for 0DTE style scalps
   ttlMinutes: Number(process.env.TRADE_TTL_MIN || 60),
+  // Options snapshot cadence (balance speed vs API load)
+  optionsPollMs: Number(process.env.OPTIONS_POLL_MS || 20_000),
+  // Flow window (seconds-level) for impulse detection
+  flowWindowSec: Number(process.env.FLOW_WINDOW_SEC || 15),
 };
 
 const app = express();
@@ -1031,6 +1041,9 @@ function computeSync() {
 async function pollDealerProfile() {
   if (!API_KEY) return;
   try {
+    // keep flow window aligned to config (seconds-level)
+    latest.dealer.flow.windowSec = CFG.flowWindowSec;
+
     const spxSpot = Number(latest.SPX?.price);
     const spySpot = Number(latest.SPY?.price);
     const vix = Number(latest.VIX?.value);
@@ -1328,11 +1341,14 @@ function maybeEmitMoveAlert() {
   // Confirmation: (a) score threshold, (b) fresh options profile, (c) fresh SPX bar, (d) dealer agreement not terrible
   const dealerFresh = dealer.spx?.blend?.timestamp ? now - Date.parse(dealer.spx.blend.timestamp) < CFG.dealerFreshMs : false;
   const barFresh = latest.status.lastSPXBarTs ? now - Number(latest.status.lastSPXBarTs) < CFG.barFreshMs : false;
+  const tickFresh = latest.status.lastSPXTs ? now - Number(latest.status.lastSPXTs) < CFG.tickFreshMs : false;
+  const flowFresh = dealer.flow?.timestamp ? now - Date.parse(dealer.flow.timestamp) < CFG.flowFreshMs : false;
   const agreement = Number(dealer.sync?.agreement || 0);
   const okAgreement = !dealer.sync?.available || agreement >= CFG.minAgreement;
   const okSession = isRthNowET(now);
 
-  if (s.trigger && dealerFresh && barFresh && okAgreement && okSession) {
+  // Discipline: TRIGGER requires seconds-level freshness (tick + flow) and a reasonably fresh dealer snapshot.
+  if (s.trigger && tickFresh && flowFresh && dealerFresh && barFresh && okAgreement && okSession) {
     if (now - lastAlertTs < CFG.triggerCooldownMs) return; // max trigger rate
     if (dailyBudget.triggers >= CFG.maxTriggersPerDay) return;
     lastAlertTs = now;
@@ -1361,7 +1377,7 @@ server.listen(PORT, () => {
 
   // Options + alerts loops (real data only)
   pollDealerProfile();
-  setInterval(pollDealerProfile, 30_000); // refresh dealer profile every 30s
+  setInterval(pollDealerProfile, CFG.optionsPollMs); // refresh dealer profile cadence
   setInterval(maybeEmitMoveAlert, 5_000); // evaluate alert engine every 5s
 });
 
