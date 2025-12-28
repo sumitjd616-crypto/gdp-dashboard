@@ -17,3 +17,21 @@ A simple Streamlit app showing the GDP of different countries in the world.
    ```
    $ streamlit run streamlit_app.py
    ```
+
+### API env file (for integrating with other scripts)
+
+This repo includes a safe template at `.env.example`. Copy it to `.env` and fill in values:
+
+```
+cp .env.example .env
+```
+
+The `.env` file is ignored by git, so you can store **API base URLs / tokens** there without committing secrets.
+
+Example usage from bash/curl:
+
+```
+set -a; source .env; set +a
+curl -sS "${API_BASE_URL}/health"
+curl -sS -H "${API_AUTH_HEADER}: ${API_AUTH_SCHEME} ${API_TOKEN}" "${API_BASE_URL}/api/status"
+```
