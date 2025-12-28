@@ -99,6 +99,7 @@ class MarketDataManager:
             # 3. Calculate GEX
             # Map: Strike -> Net Gamma
             strike_gamma = {}
+            net_gex_total = 0
             
             for opt in results:
                 details = opt.get('details', {})
@@ -134,10 +135,6 @@ class MarketDataManager:
                 # Dealer Short Call -> Negative Gamma -> Market instability (Hedging same direction)
                 # Dealer Short Put -> Positive Gamma -> Market stability (Hedging inverse)
                 
-                # Wait.
-                # Dealer Short Call: Price UP -> Delta becomes more negative -> Dealer Buys -> Pro-cyclical.
-                # Dealer Short Put: Price DOWN -> Delta becomes more positive -> Dealer Buys -> Counter-cyclical.
-                
                 # Let's stick to simple "Wall" logic.
                 # Call Wall = Resistance. Put Wall = Support.
                 
@@ -153,20 +150,23 @@ class MarketDataManager:
                 # Call - Put ?
                 if contract_type == 'call':
                     strike_gamma[strike] += gex_val
+                    net_gex_total += gex_val * spot * 0.01 # Approx dollar gamma for net
                 else:
                     strike_gamma[strike] += gex_val # Storing ABSOLUTE GAMMA for Nodes
+                    net_gex_total -= gex_val * spot * 0.01
             
             # Convert to Nodes
             nodes = []
-            total_net_gex = 0 # Placeholder for directional gex
+            
+            # Determine "Flip" (Max Gamma Strike or Zero Net GEX)
+            # Simple Flip = Strike where Call GEX ~= Put GEX ?
+            # Or just return Spot for now.
+            # Let's use the strike with max Total Gamma as a key level.
             
             for k, g in strike_gamma.items():
                 nodes.append(Node(float(k), float(g)))
             
-            # Flip Level = Strike with zero Net GEX? 
-            # Simplified: Strike with Max Gamma is the "Anchor"
-            
-            return nodes, 0, spot # Returning spot as flip for now if calcs are complex
+            return nodes, net_gex_total, spot # Returning spot as flip for now if calcs are complex
             
         except Exception as e:
             print(f"Data Fetch Error: {e}")
