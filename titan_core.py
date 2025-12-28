@@ -43,33 +43,45 @@ class TitanEngineV3:
         now = int(time.time() * 1000)
         self._process_tick_state(now, ke, vix)
         
-        # 1. Gaussian Force
+        # 1. Gaussian Force (Static Structure)
         sigma = self._calc_sigma(vix)
         force = self._compute_gaussian_force(spot, nodes, sigma)
         
-        # 2. Vanna Multiplier
-        vanna_mult = self._calc_vanna_multiplier(gex, spot > flip)
+        # 2. Vanna Force (Dynamic Volatility Flow)
+        # If VIX is dropping, Dealers BUY back Short Calls -> Force UP
+        # If VIX is rising, Dealers SELL -> Force DOWN
+        vix_change = vix - self.prev_vix
+        # Vanna is stronger when Net GEX is large
+        vanna_force = -vix_change * (gex / CONFIG.GEX_SIG) * 2.0 
         
         # 3. Vacuum Hysteresis
         for n in nodes:
             self._update_vacuum_state(n, spot)
             
-        # Audit
+        # Combine Forces
+        total_conf = force['confidence'] + (vanna_force * 10) # Vanna kicker
+        total_conf = min(99, max(0, total_conf))
+        
+        # Determine Dominant Direction
+        # If Gaussian says UP but VIX Spiking (Vanna DOWN) -> Conflict/Chop
+        final_dir = force['dir']
+        if force['dir'] == 'UP' and vanna_force < -1: final_dir = 'CHOP'
+        if force['dir'] == 'DOWN' and vanna_force > 1: final_dir = 'CHOP'
+
         return {
             "status": self.quality,
-            "force_dir": force['dir'],
-            "force_conf": force['confidence'],
-            "vanna_mult": vanna_mult,
+            "force_dir": final_dir,
+            "force_conf": total_conf,
+            "vanna_force": vanna_force,
             "vacuum_active": len(self.vacuum_strikes) > 0,
-            "sizing": self._calculate_kelly(force['confidence'], 1.5, vanna_mult),
+            "sizing": self._calculate_kelly(total_conf, 1.5, 1.0),
             "sigma": sigma,
-            "audit": f"PHYSICS: {force['dir']} ({force['confidence']:.1f}%) | VANNA: {vanna_mult:.1f}x | STATE: {self.quality}"
+            "audit": f"PHYSICS: {force['dir']} | VANNA: {vanna_force:.2f} | QUALITY: {self.quality}"
         }
 
     def _process_tick_state(self, now, ke, vix):
         gap = now - self.last_update
-        # On first run, gap is huge -> GAP state -> Warmup. Correct.
-        if gap > CONFIG.GAP_THRESHOLD_MS:
+        if gap > CONFIG.GAP_THRESHOLD_MS and self.last_update != 0:
             self.quality = 'GAP'
             self.warmup = CONFIG.WARMUP_TICKS
         elif self.warmup > 0:
@@ -80,6 +92,8 @@ class TitanEngineV3:
             
         self.last_update = now
         self.prev_ke = ke
+        # self.prev_vix update moved to analyze start to catch change? 
+        # No, update at end is correct for next tick comparison
         self.prev_vix = vix
 
     def _update_vacuum_state(self, n, spot):
@@ -89,20 +103,10 @@ class TitanEngineV3:
         elif n.strike in self.vacuum_strikes and dist < CONFIG.VACUUM_EXIT_DIST:
             self.vacuum_strikes.discard(n.strike)
 
-    def _calc_vanna_multiplier(self, gex, above_flip):
-        mag = abs(gex) / CONFIG.GEX_SIG
-        if not above_flip:
-            return 1.5 + (mag * 0.3)
-        return 0.7
-
     def _calculate_kelly(self, conf, rr, mult):
-        if self.quality != 'GOOD':
-            return 0.0
-        
-        p = (conf / 100.0) * (1.2 if mult > 1 else 0.8)
+        if self.quality != 'GOOD': return 0.0
+        p = (conf / 100.0) * mult
         if p <= 0: return 0.0
-        
-        # Kelly: f = (p(b+1) - 1) / b  -> ((RR * p) - q) / RR
         q = 1.0 - p
         k = ((rr * p) - q) / rr
         return max(0.0, k * CONFIG.KELLY_FRACTION)
@@ -113,20 +117,14 @@ class TitanEngineV3:
     def _compute_gaussian_force(self, spot, nodes, sigma):
         up = 0.0
         down = 0.0
-        
         for n in nodes:
             weight = (n.abs_gamma / CONFIG.GEX_SIG) * self._gaussian_pdf(spot, n.strike, sigma)
-            if n.strike > spot:
-                up += weight
-            else:
-                down += weight
-                
+            if n.strike > spot: up += weight
+            else: down += weight
         total = up + down
         diff = up - down
-        
         direction = 'UP' if diff > 0 else 'DOWN'
         confidence = min(99.0, (abs(diff) / total) * 100.0) if total > 0 else 0.0
-        
         return {"dir": direction, "confidence": confidence}
 
     def _gaussian_pdf(self, x, mu, sigma):
