@@ -217,11 +217,12 @@ with col_side:
     if abs(result['vanna_force']) > 2.0: st.info(f"🌊 Vanna Tailwinds: {'Bearish' if result['vanna_force'] > 0 else 'Bullish'}")
 
 # 3. DETAILS
-with st.expander("Live Dealer Commentary", expanded=True):
+with st.expander("⚔️ LIVE TACTICAL GUIDE (Titan Brain)", expanded=True):
     commentary = st.session_state.mc.generate_commentary(
         spot_price, net_gex, flip_level, 
         result['force_dir'], result['force_conf'], 
-        result['vacuum_active'], result['vanna_force']
+        result['vacuum_active'], result['vanna_force'],
+        result['flow_score'], result['signal']
     )
     st.markdown(commentary)
 

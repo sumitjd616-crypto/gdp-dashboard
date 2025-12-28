@@ -1,68 +1,83 @@
 import requests
 from config import APIConfig
 import pandas as pd
-from datetime import datetime
 
 class MarketCommentary:
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update(APIConfig.get_headers())
-        self.base_url = APIConfig.BASE_URL
-        
-    def get_context(self, ticker="SPY"):
-        try:
-            # 1. Previous Day Close
-            prev_close = 0
-            r_prev = self.session.get(f"{self.base_url}/v2/aggs/ticker/{ticker}/prev", timeout=5)
-            if r_prev.status_code == 200:
-                prev_close = r_prev.json()['results'][0]['c']
-                
-            # 2. Pre-Market Range (4am - 9:30am ET)
-            # Need to fetch agg bars for today
-            # Simple approximation: Get today's open vs current
-            
-            # For now, let's just return key levels
-            return {
-                "prev_close": prev_close,
-                "pivot": prev_close # Simplified Pivot
-            }
-        except:
-            return {"prev_close": 0, "pivot": 0}
+        pass
 
-    def generate_commentary(self, spot, net_gex, flip, force_dir, force_conf, vacuum, vanna):
+    def generate_commentary(self, spot, net_gex, flip, force_dir, force_conf, vacuum, vanna, flow_score, signal):
         """
-        Generates trader-focused commentary comparing current action to structure.
+        Generates tactical trading guidance (Entry/Exit/Stop) based on engine state.
         """
-        bias = "NEUTRAL"
-        if force_conf > 60: bias = force_dir
         
-        # Structure Analysis
-        structure_msg = ""
-        if net_gex > 0:
-            structure_msg = "Market is in **Positive Gamma** (Dampened Volatility). Dealers are fading moves."
+        # 1. HEADLINE
+        headline = "😴 MARKET CHOP - PATIENCE"
+        color = "gray"
+        
+        if signal == "CONVICTION_TRADE":
+            headline = f"🚀 PRIME {force_dir} SETUP DETECTED"
+            color = "green" if force_dir == "UP" else "red"
+        elif signal == "FLOW_DIVERGENCE":
+            headline = f"⚠️ CAUTION - {force_dir} FAKEOUT LIKELY"
+            color = "orange"
+        elif vacuum:
+            headline = "🚨 VACUUM ACCELERATION PHASE"
+            color = "purple"
+
+        # 2. TACTICAL PLAN
+        plan = ""
+        stop_loss = ""
+        target = ""
+        
+        if signal == "CONVICTION_TRADE":
+            if force_dir == "UP":
+                plan = "Look for pullback to VWAP to ENTER LONG. Buyers are aggressive."
+                stop_loss = f"Stop below {spot - 3:.2f} (Structure Support)"
+                target = f"Target {spot + 10:.2f} (Next Gamma Level)"
+            else:
+                plan = "Sell rallies. Aggressive selling into weakness detected."
+                stop_loss = f"Stop above {spot + 3:.2f} (Structure Res)"
+                target = f"Target {spot - 10:.2f} (Vacuum Floor)"
+        
+        elif signal == "FLOW_DIVERGENCE":
+            plan = f"DO NOT CHASE the {force_dir} move. Aggressors are trading AGAINST the structure."
+            stop_loss = "Wait for flow to align with structure."
+            target = "No trade."
+
+        elif vacuum:
+            plan = "MOMENTUM TRADE ONLY. Do not fade. Price is in freefall/skyrocket mode."
+            stop_loss = "Tight trailing stop (2pts). Volatility is expanding."
+            target = "Next High Volume Node."
+            
         else:
-            structure_msg = "Market is in **Negative Gamma** (High Volatility). Dealers are chasing moves."
-            
-        # Vanna/Vol Context
-        vanna_msg = ""
-        if vanna > 1.0:
-            vanna_msg = "Vanna flows are **Supportive** (VIX dropping), adding tailwind to bulls."
-        elif vanna < -1.0:
-            vanna_msg = "Vanna flows are **Bearish** (VIX rising), adding pressure to downside."
-            
-        # Vacuum Context
-        vac_msg = "No structural voids nearby."
-        if vacuum:
-            vac_msg = "🚨 **VACUUM TRIGGERED**: Price has entered a low-liquidity pocket. Expect acceleration."
-            
-        return f"""
-        **Market Context**:
-        *   **Structure**: {structure_msg}
-        *   **Dealer Positioning**: Net GEX is {"Bullish" if net_gex > 0 else "Bearish"}. Flip Level at {flip}.
-        *   **Flow Dynamics**: {vanna_msg}
-        
-        **Live Action**:
-        *   Physics Engine is signaling **{bias} ({force_conf:.0f}%)**.
-        *   {vac_msg}
-        """
+            plan = "Market is balancing. Theta decay active. Scalp 2-3 points or SIT ON HANDS."
+            stop_loss = "Tight stops if scalping."
+            target = "Range bound."
 
+        # 3. EVIDENCE (Reasoning)
+        reasons = []
+        if abs(flow_score) > 0.5:
+            reasons.append(f"**Flow**: Net Aggressors are {'Buying' if flow_score > 0 else 'Selling'} ({flow_score:.2f} sigma)")
+        if abs(vanna) > 1.0:
+            reasons.append(f"**Vanna**: Volatility flow is {'supporting' if (vanna > 0 and force_dir=='UP') else 'drag'} the move")
+        if net_gex > 0:
+            reasons.append("**Structure**: Positive Gamma (Dealers dampen volatility - Expect mean reversion)")
+        else:
+            reasons.append("**Structure**: Negative Gamma (Dealers expand volatility - Expect acceleration)")
+
+        evidence_str = "\n".join([f"* {r}" for r in reasons])
+
+        return f"""
+        ### **{headline}**
+        
+        **🛡️ BATTLE PLAN**
+        *   **Action**: {plan}
+        *   **Stop Loss**: {stop_loss}
+        *   **Target**: {target}
+        
+        **🧠 THE "WHY" (Engine Logic)**
+        {evidence_str}
+        
+        *(Confidence: {force_conf:.0f}% | Flow Score: {flow_score:.2f})*
+        """
