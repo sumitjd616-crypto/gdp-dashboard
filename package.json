@@ -1,0 +1,25 @@
+{
+  "name": "titan-physics-engine",
+  "version": "2.5.0",
+  "description": "TITAN Physics Engine v2.5 - Options trading analysis with gamma exposure, IV crush detection, and position sizing",
+  "main": "dist/titan-physics-engine.js",
+  "types": "dist/titan-physics-engine.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "demo": "npx ts-node src/titan-physics-engine.ts",
+    "test": "echo \"No tests specified\" && exit 0"
+  },
+  "keywords": [
+    "options",
+    "trading",
+    "gamma",
+    "physics",
+    "analysis"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "ts-node": "^10.9.2",
+    "@types/node": "^20.10.6"
+  }
+}
