@@ -42,7 +42,7 @@ streamer = init_streamer()
 
 st.sidebar.title("TITAN V4.0")
 mode = st.sidebar.radio("Data Feed", ["Live API (Polygon)", "Simulated"], index=0)
-ticker = st.sidebar.text_input("Ticker", "SPY").upper()
+ticker = st.sidebar.text_input("Ticker", "SPX").upper()
 
 spot_price = 0
 vix = 15

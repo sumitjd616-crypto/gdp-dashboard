@@ -41,13 +41,10 @@ class TitanStreamer:
         auth_data = {"action": "auth", "params": APIConfig.TOKEN}
         ws.send(json.dumps(auth_data))
         
-        # Subscribe
-        # T.* = All Trades (Too heavy?) -> Let's do T.SPY
-        # A.* = Aggregates (Second bars) -> A.SPY
-        # I.* = Indices -> I.VIX (Polygon Indices cluster is different usually)
-        
-        # Note: Polygon Indices are often on a separate cluster or channel.
-        # Stocks cluster handles SPY.
+        # Subscribe to SPY and VIX (Indices cluster usually requires separate sub but lets try T.SPY and A.I:VIX)
+        # Polygon Stocks Cluster handles SPY. Indices cluster handles I:VIX.
+        # Ideally we need two connections or check if Stocks cluster broadcasts Index aggregates.
+        # For simplicity in V4, we focus on SPY trades which proxy SPX moves well intraday.
         subs = {"action": "subscribe", "params": "T.SPY"}
         ws.send(json.dumps(subs))
         self.connected = True

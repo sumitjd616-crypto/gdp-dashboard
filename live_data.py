@@ -19,46 +19,78 @@ class MarketDataManager:
             return r.status_code == 200
         except: return False
 
-    def get_spot_price(self, ticker="SPY"):
+    def get_spot_price(self, ticker="SPX"):
         try:
-            # 1. Try Real-Time Trade
-            resp = self.session.get(f"{self.base_url}/v2/last/trade/{ticker}", timeout=APIConfig.TIMEOUT)
+            # Handle Index Tickers (I:SPX) vs Stocks (SPY)
+            query_ticker = ticker
+            if ticker == "SPX": query_ticker = "I:SPX"
+            
+            # Try Real-Time Trade first (Indices don't have 'trades', they have 'values' or 'aggregates')
+            endpoint = f"/v2/last/trade/{query_ticker}" if "I:" not in query_ticker else f"/v2/aggs/ticker/{query_ticker}/prev"
+            
+            resp = self.session.get(f"{self.base_url}{endpoint}", timeout=APIConfig.TIMEOUT)
             if resp.status_code == 200:
                 data = resp.json()
-                if data.get('results'): return data['results']['p']
+                if "I:" in query_ticker: return data['results'][0]['c'] # Index Close/Val
+                if data.get('results'): return data['results']['p'] # Stock Trade
             
-            # 2. Fallback to Prev Close
-            resp_agg = self.session.get(f"{self.base_url}/v2/aggs/ticker/{ticker}/prev", timeout=APIConfig.TIMEOUT)
+            # Fallback
+            resp_agg = self.session.get(f"{self.base_url}/v2/aggs/ticker/{query_ticker}/prev", timeout=APIConfig.TIMEOUT)
             if resp_agg.status_code == 200: return resp_agg.json()['results'][0]['c']
+            
         except Exception as e:
             print(f"Error fetching spot: {e}")
         return 0.0
 
     def get_vix(self):
-        for t in ["I:VIX", "VIX", "VIXY"]:
-            try:
-                resp = self.session.get(f"{self.base_url}/v2/aggs/ticker/{t}/prev", timeout=3)
-                if resp.status_code == 200: return resp.json()['results'][0]['c']
-            except: continue
+        # Explicit VIX fetch
+        try:
+            resp = self.session.get(f"{self.base_url}/v2/aggs/ticker/I:VIX/prev", timeout=3)
+            if resp.status_code == 200: return resp.json()['results'][0]['c']
+        except: pass
         return 15.0
 
-    def get_option_chain_gex(self, ticker="SPY", spot=None):
+    def get_option_chain_gex(self, ticker="SPX", spot=None):
+        # SPX Options are under "SPX" or "SPXW" usually.
+        # Polygon uses "SPX" for Index options.
+        # Index Options have different multiplier? No, x100 usually.
+        # Note: SPX is an Index, SPY is an ETF.
+        
+        # Adjust Ticker for Index lookups if needed
+        # Polygon expects "I:SPX" for index price, but "SPX" for options root.
+        
+        target_root = "SPX" if "SPX" in ticker else ticker
         if spot is None: spot = self.get_spot_price(ticker)
+        
         if spot == 0: return [], 0, 0, pd.DataFrame()
 
         try:
-            # 1. Get Nearest Expiry
             today = datetime.now().strftime("%Y-%m-%d")
+            
+            # SPX (Index) often has AM and PM settlements. 
+            # We want SPXW (Weeklies) for 0DTE usually, or standard SPX.
+            # Polygon lumps them? 
+            # Let's search contracts under underlying_ticker=SPX
+            
             r = self.session.get(f"{self.base_url}/v3/reference/options/contracts", params={
-                "underlying_ticker": ticker, "expiration_date.gte": today, "limit": 1, "sort": "expiration_date", "order": "asc"
+                "underlying_ticker": target_root, 
+                "expiration_date.gte": today, 
+                "limit": 1, 
+                "sort": "expiration_date", 
+                "order": "asc"
             }, timeout=APIConfig.TIMEOUT)
             
-            if r.status_code != 200 or not r.json().get('results'): return [], 0, 0, pd.DataFrame()
+            if r.status_code != 200 or not r.json().get('results'): 
+                # Fallback to SPY if SPX fails (User might not have Index entitlement)
+                if target_root == "SPX":
+                    print("SPX Options failed, trying SPY proxy...")
+                    return self.get_option_chain_gex("SPY", spot)
+                return [], 0, 0, pd.DataFrame()
+
             expiry = r.json()['results'][0]['expiration_date']
             
-            # 2. Vectorized Snapshot Fetch
-            # We fetch ALL strikes for this expiry
-            r_snap = self.session.get(f"{self.base_url}/v3/snapshot/options/{ticker}", params={
+            # Fetch Chain
+            r_snap = self.session.get(f"{self.base_url}/v3/snapshot/options/{target_root}", params={
                 "expiration_date": expiry, "limit": 250
             }, timeout=10)
             
