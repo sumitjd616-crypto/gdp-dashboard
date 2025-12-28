@@ -205,7 +205,16 @@ with col_side:
 
     st.subheader("Alerts")
     if result['vacuum_active']: st.error("🚨 VACUUM ACCELERATION")
-    if abs(result['vanna_force']) > 2.0: st.warning(f"🌊 HIGH VANNA FLOW: {'Bearish' if result['vanna_force'] > 0 else 'Bullish'}")
+    
+    # Conviction Alerts
+    if result['signal'] == "CONVICTION_TRADE":
+        st.success(f"🚀 **PRIME SETUP**: {result['force_dir']} w/ FLOW CONFIRMATION")
+        # Audio cue logic would go here (requires frontend JS hack, sticking to visual for now)
+        
+    elif result['signal'] == "FLOW_DIVERGENCE":
+        st.warning(f"⚠️ **TRAP DETECTED**: Structure says {result['force_dir']} but Flow disagrees")
+    
+    if abs(result['vanna_force']) > 2.0: st.info(f"🌊 Vanna Tailwinds: {'Bearish' if result['vanna_force'] > 0 else 'Bullish'}")
 
 # 3. DETAILS
 with st.expander("Live Dealer Commentary", expanded=True):
