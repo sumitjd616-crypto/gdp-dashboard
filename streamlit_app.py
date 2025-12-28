@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import time
 from titan_core import TitanEngineV3, Node
+from live_data import MarketDataManager
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIG & SETUP
@@ -13,48 +14,67 @@ st.set_page_config(page_title="TITAN V3.0 | Dealer Positioning", page_icon="⚡"
 if 'engine' not in st.session_state:
     st.session_state.engine = TitanEngineV3()
     st.session_state.history = []
+    st.session_state.dm = MarketDataManager()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR: MARKET SIMULATION
+# SIDEBAR: DATA CONTROL
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.sidebar.title("MKTSIM Control")
+st.sidebar.title("Data Feed")
+mode = st.sidebar.radio("Source", ["Simulated", "Live API (Polygon)"])
+ticker = st.sidebar.text_input("Ticker", "SPY").upper()
 
-# Market Inputs
-spot_price = st.sidebar.number_input("Spot Price (SPX)", 4000.0, 4300.0, 4150.0, 1.0)
-vix = st.sidebar.slider("VIX", 10.0, 40.0, 15.0)
-ke = st.sidebar.slider("Kinetic Energy (Volume/Flow)", 0, 100, 50)
-flip_level = st.sidebar.number_input("Gamma Flip Level", 4000, 4300, 4155)
-net_gex = st.sidebar.number_input("Net GEX (Billions)", -10.0, 10.0, -2.0) * 1e9
+spot_price = 0
+vix = 15
+nodes = []
+net_gex = 0
+flip_level = 0
+ke = 0
 
-# Dealer Positioning (Gamma Profile)
-st.sidebar.subheader("Dealer Positioning")
-profile_type = st.sidebar.selectbox("Gamma Profile", ["Neutral", "Call Wall (Resistance)", "Put Wall (Support)", "Vacuum/Thin"])
-
-def generate_nodes(center, profile):
-    nodes = []
-    strikes = range(int(center)-50, int(center)+55, 5)
+if mode == "Live API (Polygon)":
+    if not st.session_state.dm.check_connection():
+        st.sidebar.error("API Connection Failed. Check .env")
+        st.stop()
+        
+    st.sidebar.success("● API Connected")
     
-    for k in strikes:
-        gamma = 1e9 # Base
-        if profile == "Call Wall (Resistance)" and k > center + 10:
-            gamma = 5e9
-        elif profile == "Put Wall (Support)" and k < center - 10:
-            gamma = 5e9
-        elif profile == "Vacuum/Thin" and abs(k - center) < 15:
-            gamma = 0.2e9 # Thin
+    # Auto-Refresh
+    if st.sidebar.button("Refresh Data"):
+        st.rerun()
+        
+    with st.spinner("Fetching Market Data..."):
+        spot_price = st.session_state.dm.get_spot_price(ticker)
+        vix = st.session_state.dm.get_vix()
+        nodes, net_gex, flip_level = st.session_state.dm.get_option_chain_gex(ticker, spot_price)
+        ke = 50 # Volume placeholder for now
+        
+        if spot_price == 0:
+            st.error("Failed to fetch Spot Price")
+            st.stop()
             
-        # Add random noise
-        gamma *= np.random.uniform(0.8, 1.2)
-        nodes.append(Node(k, abs(gamma)))
-    return nodes
-
-# Cache nodes so they don't jump around unless profile changes
-if 'nodes' not in st.session_state or st.session_state.last_profile != profile_type:
-    st.session_state.nodes = generate_nodes(4150, profile_type) # Fixed center for stability
-    st.session_state.last_profile = profile_type
-
-nodes = st.session_state.nodes
+else:
+    # Market Inputs
+    spot_price = st.sidebar.number_input("Spot Price", 400.0, 5000.0, 415.0, 0.1)
+    vix = st.sidebar.slider("VIX", 10.0, 40.0, 15.0)
+    ke = st.sidebar.slider("Kinetic Energy", 0, 100, 50)
+    flip_level = st.sidebar.number_input("Gamma Flip", 400, 5000, 416)
+    net_gex = st.sidebar.number_input("Net GEX (B)", -10.0, 10.0, -2.0) * 1e9
+    
+    # Dealer Positioning (Gamma Profile)
+    profile_type = st.sidebar.selectbox("Gamma Profile", ["Neutral", "Call Wall", "Put Wall", "Vacuum"])
+    
+    def generate_nodes(center, profile):
+        n = []
+        strikes = range(int(center)-10, int(center)+11, 1)
+        for k in strikes:
+            gamma = 1e9 # Base
+            if profile == "Call Wall" and k > center + 2: gamma = 5e9
+            elif profile == "Put Wall" and k < center - 2: gamma = 5e9
+            elif profile == "Vacuum" and abs(k - center) < 3: gamma = 0.2e9
+            n.append(Node(k, abs(gamma)))
+        return n
+        
+    nodes = generate_nodes(spot_price, profile_type)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENGINE ANALYSIS
@@ -84,14 +104,14 @@ if len(st.session_state.history) > 50:
 # DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.title("TITAN V3.0 PHYSICS ENGINE")
+st.title(f"TITAN V3.0 | {ticker}")
 st.markdown("### *Catching 10-15pt Moves via Dealer Positioning*")
 
 # 1. TOP METRICS
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Physics Force", f"{result['force_dir']}", f"{result['force_conf']:.1f}% Conf")
-col2.metric("Vanna Multiplier", f"{result['vanna_mult']:.2f}x", delta_color="off")
-col3.metric("Rec. Sizing (Kelly)", f"{result['sizing']*100:.1f}%", help="Suggested position size based on edge")
+col2.metric("Vanna Multiplier", f"{result['vanna_mult']:.2f}x")
+col3.metric("Spot Price", f"{spot_price:.2f}")
 col4.metric("Data Quality", result['status'], delta_color="normal" if result['status'] == 'GOOD' else "inverse")
 
 # 2. ALERTS
@@ -106,29 +126,29 @@ else:
 c1, c2 = st.columns([2, 1])
 
 with c1:
-    st.subheader("Gamma Landscape (Battlefield)")
-    
-    # Prepare Data
-    df_nodes = pd.DataFrame([{
-        'Strike': n.strike, 
-        'Gamma': n.abs_gamma/1e9,
-        'Type': 'Call Wall' if n.strike > spot_price else 'Put Wall'
-    } for n in nodes])
-    
-    # Chart
-    st.bar_chart(df_nodes.set_index('Strike')['Gamma'])
-    st.caption(f"Current Spot: {spot_price} | Flip Level: {flip_level}")
+    st.subheader("Gamma Landscape")
+    if nodes:
+        df_nodes = pd.DataFrame([{
+            'Strike': n.strike, 
+            'Gamma': n.abs_gamma/1e9, # Billions
+        } for n in nodes])
+        
+        # Filter near spot
+        df_nodes = df_nodes[
+            (df_nodes['Strike'] > spot_price * 0.98) & 
+            (df_nodes['Strike'] < spot_price * 1.02)
+        ]
+        
+        st.bar_chart(df_nodes.set_index('Strike')['Gamma'])
+    else:
+        st.write("No Gamma Data Available")
 
 with c2:
     st.subheader("Force Momentum")
     df_hist = pd.DataFrame(st.session_state.history)
     if not df_hist.empty:
         st.line_chart(df_hist.set_index('timestamp')['force'])
-    else:
-        st.write("Waiting for data points...")
 
 # 4. AUDIT LOG
-with st.expander("Engine Audit Log", expanded=True):
+with st.expander("Engine Audit Log", expanded=False):
     st.code(result['audit'])
-    st.write(f"Sigma: {result['sigma']:.2f}")
-
