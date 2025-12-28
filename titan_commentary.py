@@ -11,7 +11,7 @@ class MarketCommentary:
         Generates tactical trading guidance (Entry/Exit/Stop) based on engine state.
         """
         
-        # 1. HEADLINE
+        # 1. HEADLINE LOGIC (Refined)
         headline = "😴 MARKET CHOP - PATIENCE"
         color = "gray"
         
@@ -19,41 +19,41 @@ class MarketCommentary:
             headline = f"🚀 PRIME {force_dir} SETUP DETECTED"
             color = "green" if force_dir == "UP" else "red"
         elif signal == "FLOW_DIVERGENCE":
-            headline = f"⚠️ CAUTION - {force_dir} FAKEOUT LIKELY"
+            headline = f"⚠️ TRAP - {force_dir} FAKEOUT LIKELY"
             color = "orange"
-        elif vacuum:
-            headline = "🚨 VACUUM ACCELERATION PHASE"
+        elif vacuum and abs(flow_score) > 0.5: # Only signal vacuum if flow supports it (Fixing "Blind Vacuum" flaw)
+            headline = "🚨 VACUUM ACCELERATION ACTIVE"
             color = "purple"
 
-        # 2. TACTICAL PLAN
+        # 2. TACTICAL PLAN (Refined)
         plan = ""
         stop_loss = ""
         target = ""
         
-        if signal == "CONVICTION_TRADE":
+        if "PRIME" in headline:
             if force_dir == "UP":
-                plan = "Look for pullback to VWAP to ENTER LONG. Buyers are aggressive."
-                stop_loss = f"Stop below {spot - 3:.2f} (Structure Support)"
-                target = f"Target {spot + 10:.2f} (Next Gamma Level)"
+                plan = "Looking for buyers? **ENTER LONG** on pullbacks. Momentum is real."
+                stop_loss = f"Hard Stop: {spot - 4:.2f} (Below Structure)"
+                target = f"Target: {spot + 15:.2f} (Next Wall)"
             else:
-                plan = "Sell rallies. Aggressive selling into weakness detected."
-                stop_loss = f"Stop above {spot + 3:.2f} (Structure Res)"
-                target = f"Target {spot - 10:.2f} (Vacuum Floor)"
+                plan = "Looking for sellers? **ENTER SHORT** on pops. Structure is collapsing."
+                stop_loss = f"Hard Stop: {spot + 4:.2f} (Above Structure)"
+                target = f"Target: {spot - 15:.2f} (Vacuum Floor)"
         
-        elif signal == "FLOW_DIVERGENCE":
-            plan = f"DO NOT CHASE the {force_dir} move. Aggressors are trading AGAINST the structure."
-            stop_loss = "Wait for flow to align with structure."
-            target = "No trade."
+        elif "TRAP" in headline:
+            plan = f"**STAND DOWN**. Physics says {force_dir} but Real Money is trading the opposite. Wait for alignment."
+            stop_loss = "N/A"
+            target = "N/A"
 
-        elif vacuum:
-            plan = "MOMENTUM TRADE ONLY. Do not fade. Price is in freefall/skyrocket mode."
-            stop_loss = "Tight trailing stop (2pts). Volatility is expanding."
+        elif "VACUUM" in headline:
+            plan = "**SCALP MODE**. Fast execution. Do not hold through bounces."
+            stop_loss = "Trailing Stop 2pts."
             target = "Next High Volume Node."
             
         else:
-            plan = "Market is balancing. Theta decay active. Scalp 2-3 points or SIT ON HANDS."
-            stop_loss = "Tight stops if scalping."
-            target = "Range bound."
+            plan = "Market is balancing (Chop). Theta decay is the winner. **NO TRADE**."
+            stop_loss = "N/A"
+            target = "N/A"
 
         # 3. EVIDENCE (Reasoning)
         reasons = []
