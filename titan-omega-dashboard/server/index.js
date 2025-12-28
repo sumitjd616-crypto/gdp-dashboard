@@ -4,6 +4,7 @@ import express from 'express';
 import { WebSocket, WebSocketServer } from 'ws';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createPhysicsEngine } from './physics/physicsEngine.js';
 
 /**
  * Titan Omega backend proxy
@@ -286,7 +287,12 @@ const latest = {
     },
   },
   alerts: [], // newest-first
+  physics: {
+    spx: null,
+  },
 };
+
+const physicsEngine = createPhysicsEngine();
 
 function computeRealtimeDealerPulse() {
   // 1Hz “pulse”: combines *latest snapshot* + *seconds-level flow* + *spot drift*.
@@ -369,6 +375,70 @@ function computeRealtimeDealerPulse() {
 function broadcastState() {
   // 1Hz state broadcast for smooth UI
   computeRealtimeDealerPulse();
+
+  // 1Hz physics layer (real inputs only; runs fast)
+  try {
+    const now = Date.now();
+    const spot = Number(latest.SPX?.price);
+    const vix = Number(latest.VIX?.value) || 15;
+    const bars = latest.bars.SPX || [];
+    const blend = latest.dealer?.spx?.blend?.available ? latest.dealer.spx.blend : null;
+    const exp = latest.dealer?.spx?.expirations?.d0 || latest.dealer?.spx?.expirations?.weekly || null;
+    const expiryTs = exp ? new Date(`${exp}T16:00:00-04:00`).getTime() : now + 6 * 60 * 60 * 1000;
+
+    // Touch counts from real SPX minute bars (same logic as frontend GEXCalculator)
+    const roundTo5 = (x) => Math.round(x / 5) * 5;
+    const touch = new Map();
+    for (const b of (bars || []).slice(0, 250)) {
+      if (!b) continue;
+      for (const px of [b.high, b.low, b.close]) {
+        if (!Number.isFinite(Number(px))) continue;
+        const s = roundTo5(Number(px));
+        touch.set(s, (touch.get(s) || 0) + 1);
+      }
+    }
+
+    const nodes = (blend?.perStrike || [])
+      .filter((s) => Number.isFinite(Number(s.strike)) && Number.isFinite(Number(s.netGEX)))
+      .slice()
+      .sort((a, b) => Math.abs(Number(a.strike) - spot) - Math.abs(Number(b.strike) - spot))
+      .slice(0, 60)
+      .map((s) => {
+        const strike = Number(s.strike);
+        const g = Number(s.netGEX);
+        return {
+          strike,
+          gamma: g,
+          absGamma: Math.abs(g),
+          sign: g >= 0 ? 1 : -1,
+          touchCount: touch.get(roundTo5(strike)) || 0,
+        };
+      });
+
+    // Recent options trades for SPX (from WS flow subs; minimal fields)
+    const trades = Array.isArray(latest?.dealer?.recentTrades?.spx) ? latest.dealer.recentTrades.spx : [];
+
+    if (Number.isFinite(spot) && nodes.length && bars.length) {
+      latest.physics.spx = physicsEngine.step({
+        now,
+        spot,
+        vix,
+        bars,
+        expiryTs,
+        nodes,
+        trades,
+        flip: blend?.levels?.gammaFlip ?? spot,
+        netGex: blend?.net?.gex ?? 0,
+        // ES proxy not wired yet (optional)
+        es: null,
+      });
+    } else {
+      latest.physics.spx = null;
+    }
+  } catch {
+    latest.physics.spx = null;
+  }
+
   wsBroadcast(wss, {
     type: 'STATE',
     data: {
@@ -379,6 +449,7 @@ function broadcastState() {
       QQQ: latest.QQQ,
       bars: latest.bars,
       dealer: latest.dealer,
+      physics: latest.physics,
       alerts: latest.alerts,
     },
   });
@@ -981,6 +1052,7 @@ const optionFlowEvents = []; // [{ ts, underlying, deltaNotional, gammaNotional 
 let currentOptionSubs = new Set();
 const optionQuoteByTicker = new Map(); // ticker -> { bid, ask, mid, ts, iv }
 const quoteAggHistory = new Map(); // underlying -> [{ ts, avgIv, skew }]
+const recentTradesByUnderlying = { SPX: [], SPY: [], QQQ: [] };
 
 function pruneFlow(windowMs) {
   const cutoff = Date.now() - windowMs;
@@ -1179,6 +1251,35 @@ function connectUpstreamOptions() {
         const gammaNotional = dealerSign * gamma * size * 100 * spot * spot;
 
         optionFlowEvents.push({ ts, underlying: under, deltaNotional, gammaNotional });
+
+        // Keep a small rolling buffer of raw-ish trades for the physics engine.
+        // We attach strike/type from our greeks map, and attach latest quote-derived IV if present.
+        try {
+          const q = optionQuoteByTicker.get(ticker);
+          const arr = recentTradesByUnderlying[under] || (recentTradesByUnderlying[under] = []);
+          arr.push({
+            timestamp: ts,
+            strike: g.strike,
+            type: g.type,
+            side: 'unknown',
+            size,
+            price: Number(msg.p || 0),
+            bid: Number(msg.bp ?? NaN),
+            ask: Number(msg.ap ?? NaN),
+            iv: q?.iv ?? null,
+            vega: null,
+            theta: null,
+          });
+          if (arr.length > 600) arr.splice(0, arr.length - 600);
+          latest.dealer.recentTrades = {
+            spx: recentTradesByUnderlying.SPX,
+            spy: recentTradesByUnderlying.SPY,
+            qqq: recentTradesByUnderlying.QQQ,
+          };
+        } catch {
+          // ignore
+        }
+
         pruneFlow((latest.dealer.flow.windowSec || 30) * 1000);
         recomputeFlow(latest.dealer.flow.windowSec || 30);
         wsBroadcast(wss, { type: 'DEALER_FLOW', data: latest.dealer.flow });
