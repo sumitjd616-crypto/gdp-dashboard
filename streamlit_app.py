@@ -4,13 +4,14 @@ import numpy as np
 import time
 from titan_core import TitanEngineV3, Node
 from live_data import MarketDataManager
+from titan_ws import get_streamer
 import plotly.graph_objects as go
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIG & SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.set_page_config(page_title="TITAN V4.0 | Fluid Dynamics", page_icon="🌊", layout="wide")
+st.set_page_config(page_title="TITAN V4.0 | Fluid Dynamics", page_icon="⚡", layout="wide")
 
 st.markdown("""
 <style>
@@ -25,6 +26,15 @@ if 'engine' not in st.session_state:
     st.session_state.engine = TitanEngineV3()
     st.session_state.history = []
     st.session_state.dm = MarketDataManager()
+
+# Initialize Streamer (Background Thread)
+# leveraging st.cache_resource to keep it alive across reruns
+@st.cache_resource
+def init_streamer():
+    s = get_streamer()
+    return s
+
+streamer = init_streamer()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
@@ -49,13 +59,53 @@ if mode == "Live API (Polygon)":
         
     st.sidebar.success("● CONNECTED")
     
-    refresh_rate = st.sidebar.slider("Scan Rate (s)", 5, 30, 10)
-    if st.sidebar.button("Force Scan") or time.time() % refresh_rate < 1:
-        with st.spinner("Calculating Fluid Dynamics..."):
-            spot_price = st.session_state.dm.get_spot_price(ticker)
+    # WebSocket Status
+    ws_price, _ = streamer.get_data()
+    if ws_price > 0:
+        st.sidebar.caption(f"⚡ WS Live: {ws_price:.2f}")
+    else:
+        st.sidebar.caption("⚡ WS Connecting...")
+    
+    # Option Chain (Slow Update)
+    # We only fetch the full chain occasionally to avoid blocking
+    if 'last_chain_update' not in st.session_state:
+        st.session_state.last_chain_update = 0
+        
+    now = time.time()
+    # Refresh chain every 30s
+    if now - st.session_state.last_chain_update > 30 or st.sidebar.button("Scan Chain"):
+        with st.spinner("Scanning Option Structure..."):
+            # Use HTTP for the heavy structure
+            spot_snap = st.session_state.dm.get_spot_price(ticker)
             vix = st.session_state.dm.get_vix()
-            nodes, net_gex, flip_level, raw_df = st.session_state.dm.get_option_chain_gex(ticker, spot_price)
-            ke = 50 
+            nodes, net_gex, flip_level, raw_df = st.session_state.dm.get_option_chain_gex(ticker, spot_snap)
+            
+            # Cache results
+            st.session_state.cached_nodes = nodes
+            st.session_state.cached_gex = net_gex
+            st.session_state.cached_flip = flip_level
+            st.session_state.cached_df = raw_df
+            st.session_state.last_chain_update = now
+    
+    # Use Cached Structure + Live Price
+    nodes = st.session_state.get('cached_nodes', [])
+    net_gex = st.session_state.get('cached_gex', 0)
+    flip_level = st.session_state.get('cached_flip', 0)
+    raw_df = st.session_state.get('cached_df', pd.DataFrame())
+    
+    # Use WS price if available, else fallback
+    if ws_price > 0:
+        spot_price = ws_price
+    else:
+        spot_price = st.session_state.dm.get_spot_price(ticker)
+        
+    ke = 50 
+    
+    # Auto-Rerun for Animation
+    # This creates the "Game Loop" effect
+    time.sleep(1) 
+    st.rerun()
+    
 else:
     spot_price = st.sidebar.number_input("Spot Price", 400.0, 5000.0, 415.0)
     vix = st.sidebar.slider("VIX", 10.0, 40.0, 15.0)
@@ -86,7 +136,7 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Spot", f"{spot_price:.2f}", f"VIX: {vix:.2f}")
 c2.metric("Gamma Force", result['force_dir'], f"{result['force_conf']:.1f}%")
 c3.metric("Vanna Flow", f"{result['vanna_force']:.2f}", "Vol Sensitivity")
-c4.metric("Status", result['status'], "Latency: ~300ms")
+c4.metric("Status", result['status'], "Latency: ~50ms (WS)")
 
 # MAIN CHART
 col_main, col_side = st.columns([3, 1])
