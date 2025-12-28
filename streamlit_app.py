@@ -63,9 +63,10 @@ if mode == "Live API (Polygon)":
     st.sidebar.success("● CONNECTED")
     
     # WebSocket Status
-    ws_price, _ = streamer.get_data()
+    ws_price, net_flow = streamer.get_data()
     if ws_price > 0:
         st.sidebar.caption(f"⚡ WS Live: {ws_price:.2f}")
+        st.sidebar.metric("Net Aggressor", f"{net_flow:.0f}", delta_color="normal")
     else:
         st.sidebar.caption("⚡ WS Connecting...")
     
@@ -119,12 +120,13 @@ else:
 # ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-result = st.session_state.engine.analyze(spot_price, nodes, net_gex, flip_level, vix, ke)
+result = st.session_state.engine.analyze(spot_price, nodes, net_gex, flip_level, vix, net_flow)
 
 st.session_state.history.append({
     "timestamp": time.strftime("%H:%M:%S"),
     "force": result['force_conf'] * (1 if result['force_dir'] == 'UP' else -1),
-    "vanna": result['vanna_force']
+    "vanna": result['vanna_force'],
+    "flow": result['flow_score']
 })
 if len(st.session_state.history) > 60: st.session_state.history.pop(0)
 
@@ -195,8 +197,8 @@ with col_side:
     # Force History
     hist_df = pd.DataFrame(st.session_state.history)
     if not hist_df.empty:
-        st.area_chart(hist_df.set_index('timestamp')['force'], height=150)
-        st.caption("Gamma Force (Structure)")
+        st.area_chart(hist_df.set_index('timestamp')[['force', 'flow']], height=200)
+        st.caption("Blue: Structure | Red: Kinetic Flow")
         
         st.line_chart(hist_df.set_index('timestamp')['vanna'], height=150)
         st.caption("Vanna Flow (Volatility)")
