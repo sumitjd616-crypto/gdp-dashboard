@@ -41,6 +41,7 @@ nodes = []
 net_gex = 0
 flip_level = 0
 ke = 0
+raw_df = pd.DataFrame()
 
 if mode == "Live API (Polygon)":
     if not st.session_state.dm.check_connection():
@@ -56,12 +57,11 @@ if mode == "Live API (Polygon)":
         with st.spinner("Scanning Market..."):
             spot_price = st.session_state.dm.get_spot_price(ticker)
             vix = st.session_state.dm.get_vix()
-            nodes, net_gex, flip_level = st.session_state.dm.get_option_chain_gex(ticker, spot_price)
+            nodes, net_gex, flip_level, raw_df = st.session_state.dm.get_option_chain_gex(ticker, spot_price)
             ke = 50 # Volume placeholder
             
         if spot_price == 0:
             st.error("Failed to fetch Spot Price")
-            # Fallback for display if history exists? No, stop.
             
 else:
     # Market Inputs (Simulation)
@@ -128,7 +128,7 @@ with c2:
     st.metric("Physics Force", f"{result['force_dir']}", f"{result['force_conf']:.1f}%", delta_color=direction_color)
 
 with c3:
-    st.metric("Est. Net GEX", f"${net_gex/1e9:.2f}B", "Dealer Exposure")
+    st.metric("Flip Level", f"{flip_level}", f"GEX: ${net_gex/1e9:.2f}B")
 
 with c4:
     status_icon = "🟢" if result['status'] == 'GOOD' else "🟡" if result['status'] == 'WARMING' else "🔴"
@@ -140,57 +140,60 @@ col_main, col_side = st.columns([2, 1])
 with col_main:
     st.subheader("Gamma Landscape & Vacuum Zones")
     
-    if nodes:
-        df_nodes = pd.DataFrame([{
-            'Strike': n.strike, 
-            'Gamma': n.abs_gamma/1e9, # Billions
-        } for n in nodes])
+    if mode == "Live API (Polygon)" and not raw_df.empty:
+        # Advanced Plot: Call GEX vs Put GEX
+        # Raw DF has 'type' ('call'/'put'), 'strike', 'gex_abs'
         
-        # Filter near spot (Dynamic Range)
-        range_pct = 0.02 # 2% range
-        df_nodes = df_nodes[
-            (df_nodes['Strike'] > spot_price * (1 - range_pct)) & 
-            (df_nodes['Strike'] < spot_price * (1 + range_pct))
+        # We need to pivot Raw DF to get Calls and Puts separate per strike
+        # Since we only have `df_strikes` (summarized) returned as `raw_df` from `get_option_chain_gex`?
+        # Wait, I returned `df` (the list of all contracts) in step 3? 
+        # No, step 3 created `df`, but step 4 grouped it.
+        # Let's check `live_data.py`. I returned `df` (the raw contract list).
+        
+        # Aggregating for Plot
+        df_plot = raw_df.groupby(['strike', 'type'])['gex_abs'].sum().unstack(fill_value=0).reset_index()
+        
+        # Filter Range
+        range_pct = 0.02
+        df_plot = df_plot[
+            (df_plot['strike'] > spot_price * (1 - range_pct)) & 
+            (df_plot['strike'] < spot_price * (1 + range_pct))
         ]
         
-        # Plotly Chart
         fig = go.Figure()
         
-        # Gamma Bars
-        fig.add_trace(go.Bar(
-            x=df_nodes['Strike'], 
-            y=df_nodes['Gamma'],
-            name='Gamma Exposure',
-            marker_color='#4444ff'
-        ))
-        
+        # Call Wall (Resistance) - Positive
+        if 'call' in df_plot.columns:
+            fig.add_trace(go.Bar(
+                x=df_plot['strike'], y=df_plot['call']/1e9,
+                name='Call GEX (Res)', marker_color='#00CC96'
+            ))
+            
+        # Put Wall (Support) - Negative
+        if 'put' in df_plot.columns:
+            fig.add_trace(go.Bar(
+                x=df_plot['strike'], y=-df_plot['put']/1e9,
+                name='Put GEX (Sup)', marker_color='#EF553B'
+            ))
+            
         # Spot Line
-        fig.add_vline(x=spot_price, line_width=3, line_dash="dash", line_color="yellow", annotation_text="SPOT")
-        
-        # Vacuum Overlay
-        # Simple Logic: If Gamma < Threshold, it's a Vacuum
-        threshold = df_nodes['Gamma'].mean() * 0.5
-        vacuum_strikes = df_nodes[df_nodes['Gamma'] < threshold]['Strike']
-        
-        # fig.add_trace(go.Scatter(
-        #     x=vacuum_strikes, 
-        #     y=[0]*len(vacuum_strikes),
-        #     mode='markers',
-        #     marker=dict(color='red', size=10, symbol='triangle-up'),
-        #     name='Vacuum Pockets'
-        # ))
+        fig.add_vline(x=spot_price, line_width=2, line_dash="dash", line_color="yellow")
         
         fig.update_layout(
+            barmode='relative', 
             template="plotly_dark",
             height=400,
-            margin=dict(l=20, r=20, t=30, b=20),
-            xaxis_title="Strike Price",
-            yaxis_title="Gamma Exposure (Billions)"
+            title="Net Gamma Exposure Profile (Billions)",
+            xaxis_title="Strike", yaxis_title="Gamma Exposure ($B)"
         )
-        
         st.plotly_chart(fig, use_container_width=True)
+        
+    elif nodes:
+        # Fallback for Simulated
+        df_nodes = pd.DataFrame([{ 'Strike': n.strike, 'Gamma': n.abs_gamma/1e9 } for n in nodes])
+        st.bar_chart(df_nodes.set_index('Strike')['Gamma'])
     else:
-        st.warning("No Option Data Found. Check Market Hours or Ticker.")
+        st.warning("No Option Data Found.")
 
 with col_side:
     st.subheader("Momentum (Force)")

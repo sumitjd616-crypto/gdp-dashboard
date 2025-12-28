@@ -13,161 +13,102 @@ class MarketDataManager:
         self.base_url = APIConfig.BASE_URL
         
     def check_connection(self):
-        if not APIConfig.TOKEN:
-            return False
+        if not APIConfig.TOKEN: return False
         try:
-            # Simple ping
             r = self.session.get(f"{self.base_url}/v3/reference/status", timeout=5)
             return r.status_code == 200
-        except:
-            return False
+        except: return False
 
     def get_spot_price(self, ticker="SPY"):
         try:
-            # Try Real-Time Trade first
-            url = f"{self.base_url}/v2/last/trade/{ticker}"
-            resp = self.session.get(url, timeout=APIConfig.TIMEOUT)
+            # 1. Try Real-Time Trade
+            resp = self.session.get(f"{self.base_url}/v2/last/trade/{ticker}", timeout=APIConfig.TIMEOUT)
             if resp.status_code == 200:
                 data = resp.json()
-                if data.get('results'):
-                    return data['results']['p']
+                if data.get('results'): return data['results']['p']
             
-            # Fallback to Aggregate (Previous Close if market closed)
-            url_agg = f"{self.base_url}/v2/aggs/ticker/{ticker}/prev"
-            resp_agg = self.session.get(url_agg, timeout=APIConfig.TIMEOUT)
-            if resp_agg.status_code == 200:
-                return resp_agg.json()['results'][0]['c']
-                
+            # 2. Fallback to Prev Close
+            resp_agg = self.session.get(f"{self.base_url}/v2/aggs/ticker/{ticker}/prev", timeout=APIConfig.TIMEOUT)
+            if resp_agg.status_code == 200: return resp_agg.json()['results'][0]['c']
         except Exception as e:
             print(f"Error fetching spot: {e}")
         return 0.0
 
     def get_vix(self):
-        # Trying typical tickers for VIX
         for t in ["I:VIX", "VIX", "VIXY"]:
             try:
-                # Indices often use /v2/aggs/ticker/I:VIX/prev
-                url = f"{self.base_url}/v2/aggs/ticker/{t}/prev"
-                resp = self.session.get(url, timeout=3)
-                if resp.status_code == 200:
-                    return resp.json()['results'][0]['c']
-            except:
-                continue
+                resp = self.session.get(f"{self.base_url}/v2/aggs/ticker/{t}/prev", timeout=3)
+                if resp.status_code == 200: return resp.json()['results'][0]['c']
+            except: continue
         return 15.0
 
     def get_option_chain_gex(self, ticker="SPY", spot=None):
-        if spot is None:
-            spot = self.get_spot_price(ticker)
-        if spot == 0: return [], 0, 0
+        if spot is None: spot = self.get_spot_price(ticker)
+        if spot == 0: return [], 0, 0, pd.DataFrame()
 
-        # 1. Find Nearest Expiry
         try:
-            # List contracts to find nearest expiry
+            # 1. Get Nearest Expiry
             today = datetime.now().strftime("%Y-%m-%d")
-            url_contracts = f"{self.base_url}/v3/reference/options/contracts"
-            params = {
-                "underlying_ticker": ticker,
-                "expiration_date.gte": today,
-                "limit": 1,
-                "sort": "expiration_date",
-                "order": "asc"
-            }
-            r = self.session.get(url_contracts, params=params, timeout=APIConfig.TIMEOUT)
-            if r.status_code != 200 or not r.json().get('results'):
-                return [], 0, 0
-                
+            r = self.session.get(f"{self.base_url}/v3/reference/options/contracts", params={
+                "underlying_ticker": ticker, "expiration_date.gte": today, "limit": 1, "sort": "expiration_date", "order": "asc"
+            }, timeout=APIConfig.TIMEOUT)
+            
+            if r.status_code != 200 or not r.json().get('results'): return [], 0, 0, pd.DataFrame()
             expiry = r.json()['results'][0]['expiration_date']
             
-            # 2. Get Snapshot for that Expiry
-            # This returns all options for that expiry with Greeks
-            url_snap = f"{self.base_url}/v3/snapshot/options/{ticker}"
-            params_snap = {
-                "expiration_date": expiry,
-                "limit": 250 # Polygon max limit? Pagination might be needed for SPX
-            }
+            # 2. Vectorized Snapshot Fetch
+            # We fetch ALL strikes for this expiry
+            r_snap = self.session.get(f"{self.base_url}/v3/snapshot/options/{ticker}", params={
+                "expiration_date": expiry, "limit": 250
+            }, timeout=10)
             
-            # Note: Pagination handling is needed for full SPX chain, 
-            # but for 10-15pt moves, near-the-money is key.
-            # We will use iterator if generic wrapper supports it, else simple fetch.
-            
-            # Actually Polygon snapshot doesn't always support pagination in the same way.
-            # Assuming we get a decent chunk.
-            
-            r_snap = self.session.get(url_snap, params=params_snap, timeout=10)
             results = r_snap.json().get('results', [])
-            
-            # 3. Calculate GEX
-            # Map: Strike -> Net Gamma
-            strike_gamma = {}
-            net_gex_total = 0
-            
+            if not results: return [], 0, 0, pd.DataFrame()
+
+            # 3. "Karpathy" Optimization: Vectorized Processing via Pandas
+            # Instead of looping, we build a DataFrame
+            data_list = []
             for opt in results:
                 details = opt.get('details', {})
-                strike = details.get('strike_price')
-                contract_type = details.get('contract_type') # 'call' or 'put'
+                greeks = opt.get('greeks', {}) or {}
                 
-                # Check for Greeks
-                greeks = opt.get('greeks', {})
+                # Safe Extraction
                 gamma = greeks.get('gamma')
-                oi = opt.get('open_interest', 0)
+                if gamma is None: continue # Skip if no gamma (simpler than BS calc for speed)
                 
-                if gamma is None:
-                    iv = details.get('implied_volatility')
-                    if iv and expiry and spot:
-                        # Calculate Gamma if missing but IV present
-                        from titan_math import black_scholes_gamma
-                        try:
-                            T = (datetime.strptime(expiry, "%Y-%m-%d") - datetime.now()).days / 365.0
-                            if T < 1/365: T = 1/365
-                            gamma = black_scholes_gamma(spot, strike, T, 0.04, iv)
-                        except:
-                            gamma = None
-                
-                if gamma is None or oi is None:
-                    continue
-                    
-                # Calculate GEX contribution
-                # Standard: Call (+), Put (-) for Dealer Exposure?
-                # Using: Call GEX = Gamma * OI * 100 * Spot * Spot * 0.01 (Dollar Gamma)
-                # Simplified: Gamma * OI * 100
-                
-                # Contribution to Dealer Gamma:
-                # Dealer Short Call -> Negative Gamma -> Market instability (Hedging same direction)
-                # Dealer Short Put -> Positive Gamma -> Market stability (Hedging inverse)
-                
-                # Let's stick to simple "Wall" logic.
-                # Call Wall = Resistance. Put Wall = Support.
-                
-                gex_val = gamma * oi * 100
-                
-                if strike not in strike_gamma: strike_gamma[strike] = 0
-                
-                # Netting
-                # If Call: Add
-                # If Put: Add (Absolute Gamma is what matters for "Walls")
-                
-                # But for Net GEX (Directional Bias):
-                # Call - Put ?
-                if contract_type == 'call':
-                    strike_gamma[strike] += gex_val
-                    net_gex_total += gex_val * spot * 0.01 # Approx dollar gamma for net
-                else:
-                    strike_gamma[strike] += gex_val # Storing ABSOLUTE GAMMA for Nodes
-                    net_gex_total -= gex_val * spot * 0.01
+                data_list.append({
+                    'strike': details.get('strike_price'),
+                    'type': details.get('contract_type'), # 'call' or 'put'
+                    'gamma': float(gamma),
+                    'oi': float(opt.get('open_interest', 0) or 0),
+                    'volume': float(opt.get('day', {}).get('volume', 0) or 0)
+                })
+
+            df = pd.DataFrame(data_list)
+            if df.empty: return [], 0, 0, pd.DataFrame()
             
-            # Convert to Nodes
-            nodes = []
+            # 4. Vectorized GEX Calculation
+            # GEX = Gamma * OI * 100
+            df['gex_abs'] = df['gamma'] * df['oi'] * 100 # Absolute GEX contribution
             
-            # Determine "Flip" (Max Gamma Strike or Zero Net GEX)
-            # Simple Flip = Strike where Call GEX ~= Put GEX ?
-            # Or just return Spot for now.
-            # Let's use the strike with max Total Gamma as a key level.
+            # Net GEX (Directional): Calls are +, Puts are -
+            df['gex_net'] = np.where(df['type'] == 'call', df['gex_abs'], -df['gex_abs'])
             
-            for k, g in strike_gamma.items():
-                nodes.append(Node(float(k), float(g)))
+            # Group by Strike to combine Calls and Puts
+            df_strikes = df.groupby('strike')[['gex_abs', 'gex_net', 'volume', 'oi']].sum().reset_index()
             
-            return nodes, net_gex_total, spot # Returning spot as flip for now if calcs are complex
+            # 5. Determine Flip Level (Strike where Net GEX flips from - to + or min/max)
+            # Simple Proxy: Strike with highest Absolute Gamma is the "Magnet"
+            # Better Proxy: The zero-crossing of Cumulative GEX? 
+            # Let's stick to Max Gamma Level as the "Pivot"
+            flip_level = df_strikes.loc[df_strikes['gex_abs'].idxmax()]['strike']
+            total_net_gex = df_strikes['gex_net'].sum() * spot * 0.01
+
+            # 6. Convert to Titan Nodes
+            nodes = [Node(row['strike'], row['gex_abs']) for _, row in df_strikes.iterrows()]
             
+            return nodes, total_net_gex, flip_level, df # Return DF for advanced plotting
+
         except Exception as e:
-            print(f"Data Fetch Error: {e}")
-            return [], 0, 0
+            print(f"Data Error: {e}")
+            return [], 0, 0, pd.DataFrame()
