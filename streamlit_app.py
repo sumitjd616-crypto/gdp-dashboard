@@ -5,6 +5,7 @@ import time
 from titan_core import TitanEngineV3, Node
 from live_data import MarketDataManager
 from titan_ws import get_streamer
+from titan_commentary import MarketCommentary
 import plotly.graph_objects as go
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -26,6 +27,8 @@ if 'engine' not in st.session_state:
     st.session_state.engine = TitanEngineV3()
     st.session_state.history = []
     st.session_state.dm = MarketDataManager()
+    st.session_state.mc = MarketCommentary()
+    st.session_state.mc = MarketCommentary()
 
 # Initialize Streamer (Background Thread)
 # leveraging st.cache_resource to keep it alive across reruns
@@ -201,3 +204,15 @@ with col_side:
     st.subheader("Alerts")
     if result['vacuum_active']: st.error("🚨 VACUUM ACCELERATION")
     if abs(result['vanna_force']) > 2.0: st.warning(f"🌊 HIGH VANNA FLOW: {'Bearish' if result['vanna_force'] > 0 else 'Bullish'}")
+
+# 3. DETAILS
+with st.expander("Live Dealer Commentary", expanded=True):
+    commentary = st.session_state.mc.generate_commentary(
+        spot_price, net_gex, flip_level, 
+        result['force_dir'], result['force_conf'], 
+        result['vacuum_active'], result['vanna_force']
+    )
+    st.markdown(commentary)
+
+with st.expander("Raw Data & Audit"):
+    st.json(result)
