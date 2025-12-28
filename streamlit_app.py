@@ -1,151 +1,134 @@
 import streamlit as st
 import pandas as pd
-import math
-from pathlib import Path
+import numpy as np
+import time
+from titan_core import TitanEngineV3, Node
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIG & SETUP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.set_page_config(page_title="TITAN V3.0 | Dealer Positioning", page_icon="⚡", layout="wide")
+
+if 'engine' not in st.session_state:
+    st.session_state.engine = TitanEngineV3()
+    st.session_state.history = []
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR: MARKET SIMULATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.sidebar.title("MKTSIM Control")
+
+# Market Inputs
+spot_price = st.sidebar.number_input("Spot Price (SPX)", 4000.0, 4300.0, 4150.0, 1.0)
+vix = st.sidebar.slider("VIX", 10.0, 40.0, 15.0)
+ke = st.sidebar.slider("Kinetic Energy (Volume/Flow)", 0, 100, 50)
+flip_level = st.sidebar.number_input("Gamma Flip Level", 4000, 4300, 4155)
+net_gex = st.sidebar.number_input("Net GEX (Billions)", -10.0, 10.0, -2.0) * 1e9
+
+# Dealer Positioning (Gamma Profile)
+st.sidebar.subheader("Dealer Positioning")
+profile_type = st.sidebar.selectbox("Gamma Profile", ["Neutral", "Call Wall (Resistance)", "Put Wall (Support)", "Vacuum/Thin"])
+
+def generate_nodes(center, profile):
+    nodes = []
+    strikes = range(int(center)-50, int(center)+55, 5)
+    
+    for k in strikes:
+        gamma = 1e9 # Base
+        if profile == "Call Wall (Resistance)" and k > center + 10:
+            gamma = 5e9
+        elif profile == "Put Wall (Support)" and k < center - 10:
+            gamma = 5e9
+        elif profile == "Vacuum/Thin" and abs(k - center) < 15:
+            gamma = 0.2e9 # Thin
+            
+        # Add random noise
+        gamma *= np.random.uniform(0.8, 1.2)
+        nodes.append(Node(k, abs(gamma)))
+    return nodes
+
+# Cache nodes so they don't jump around unless profile changes
+if 'nodes' not in st.session_state or st.session_state.last_profile != profile_type:
+    st.session_state.nodes = generate_nodes(4150, profile_type) # Fixed center for stability
+    st.session_state.last_profile = profile_type
+
+nodes = st.session_state.nodes
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENGINE ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Run Engine
+result = st.session_state.engine.analyze(
+    spot=spot_price,
+    nodes=nodes,
+    gex=net_gex,
+    flip=flip_level,
+    vix=vix,
+    ke=ke
 )
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Store History
+st.session_state.history.append({
+    "timestamp": time.strftime("%H:%M:%S"),
+    "spot": spot_price,
+    "force": result['force_conf'] * (1 if result['force_dir'] == 'UP' else -1),
+    "sizing": result['sizing']
+})
+if len(st.session_state.history) > 50:
+    st.session_state.history.pop(0)
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# ═══════════════════════════════════════════════════════════════════════════════
+# DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+st.title("TITAN V3.0 PHYSICS ENGINE")
+st.markdown("### *Catching 10-15pt Moves via Dealer Positioning*")
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+# 1. TOP METRICS
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Physics Force", f"{result['force_dir']}", f"{result['force_conf']:.1f}% Conf")
+col2.metric("Vanna Multiplier", f"{result['vanna_mult']:.2f}x", delta_color="off")
+col3.metric("Rec. Sizing (Kelly)", f"{result['sizing']*100:.1f}%", help="Suggested position size based on edge")
+col4.metric("Data Quality", result['status'], delta_color="normal" if result['status'] == 'GOOD' else "inverse")
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+# 2. ALERTS
+if result['vacuum_active']:
+    st.error("🚨 VACUUM ZONE DETECTED - ACCELERATION LIKELY")
+elif result['force_conf'] > 75:
+    st.success(f"🚀 HIGH CONVICTION {result['force_dir']} SETUP")
+else:
+    st.info("Market Grinding - Waiting for Setup")
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+# 3. VISUALIZATION
+c1, c2 = st.columns([2, 1])
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+with c1:
+    st.subheader("Gamma Landscape (Battlefield)")
+    
+    # Prepare Data
+    df_nodes = pd.DataFrame([{
+        'Strike': n.strike, 
+        'Gamma': n.abs_gamma/1e9,
+        'Type': 'Call Wall' if n.strike > spot_price else 'Put Wall'
+    } for n in nodes])
+    
+    # Chart
+    st.bar_chart(df_nodes.set_index('Strike')['Gamma'])
+    st.caption(f"Current Spot: {spot_price} | Flip Level: {flip_level}")
 
-    return gdp_df
+with c2:
+    st.subheader("Force Momentum")
+    df_hist = pd.DataFrame(st.session_state.history)
+    if not df_hist.empty:
+        st.line_chart(df_hist.set_index('timestamp')['force'])
+    else:
+        st.write("Waiting for data points...")
 
-gdp_df = get_gdp_data()
+# 4. AUDIT LOG
+with st.expander("Engine Audit Log", expanded=True):
+    st.code(result['audit'])
+    st.write(f"Sigma: {result['sigma']:.2f}")
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
