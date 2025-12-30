@@ -1,5 +1,15 @@
 .streamlit/secrets.toml
 
+# TITAN Trading System specific
+titan.db
+titan.db-shm
+titan.db-wal
+trades/
+backtest_results/
+.env.local
+*credentials*
+*api_key*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
