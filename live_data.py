@@ -51,7 +51,7 @@ class MarketDataManager:
     def get_option_chain_gex(self, ticker="SPX", spot=None):
         target_root = "SPX" if "SPX" in ticker else ticker
         if spot is None: spot = self.get_spot_price(ticker)
-        if spot == 0: return [], 0, 0, pd.DataFrame()
+        if spot == 0: return [], 0, 0, pd.DataFrame(), None
 
         try:
             today = datetime.now().strftime("%Y-%m-%d")
@@ -70,7 +70,7 @@ class MarketDataManager:
             
             if r.status_code != 200 or not r.json().get('results'): 
                 if target_root == "SPX": return self.get_option_chain_gex("SPY", spot)
-                return [], 0, 0, pd.DataFrame()
+                return [], 0, 0, pd.DataFrame(), None
 
             expiry = r.json()['results'][0]['expiration_date']
             

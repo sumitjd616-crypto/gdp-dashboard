@@ -6,7 +6,7 @@ class MarketCommentary:
     def __init__(self):
         pass
 
-    def generate_commentary(self, spot, net_gex, flip, force_dir, force_conf, vacuum, vanna, flow_score, signal):
+    def generate_commentary(self, spot, net_gex, flip, force_dir, force_conf, vacuum, vanna, flow_score, signal, kelly_size=0.0):
         """
         Generates tactical trading guidance (Entry/Exit/Stop) based on engine state.
         """
@@ -29,6 +29,7 @@ class MarketCommentary:
         plan = ""
         stop_loss = ""
         target = ""
+        size_guide = f"Risk {kelly_size*100:.1f}% of Cap" if kelly_size > 0 else "N/A"
         
         if "PRIME" in headline:
             if force_dir == "UP":
@@ -54,6 +55,7 @@ class MarketCommentary:
             plan = "Market is balancing (Chop). Theta decay is the winner. **NO TRADE**."
             stop_loss = "N/A"
             target = "N/A"
+            size_guide = "0%"
 
         # 3. EVIDENCE (Reasoning)
         reasons = []
@@ -75,6 +77,7 @@ class MarketCommentary:
         *   **Action**: {plan}
         *   **Stop Loss**: {stop_loss}
         *   **Target**: {target}
+        *   **Size**: {size_guide}
         
         **🧠 THE "WHY" (Engine Logic)**
         {evidence_str}

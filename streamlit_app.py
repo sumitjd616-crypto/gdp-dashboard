@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import time
-from titan_core import TitanEngineV3, Node
+from titan_core import TitanEngineV6, Node
 from live_data import MarketDataManager
 from titan_ws import get_streamer
 from titan_commentary import MarketCommentary
@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 # CONFIG & SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.set_page_config(page_title="TITAN V4.0 | Fluid Dynamics", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="TITAN V6.0 | OMNI", page_icon="⚡", layout="wide")
 
 st.markdown("""
 <style>
@@ -24,10 +24,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 if 'engine' not in st.session_state:
-    st.session_state.engine = TitanEngineV3()
+    st.session_state.engine = TitanEngineV6()
     st.session_state.history = []
     st.session_state.dm = MarketDataManager()
-    st.session_state.mc = MarketCommentary()
     st.session_state.mc = MarketCommentary()
 
 # Initialize Streamer (Background Thread)
@@ -43,7 +42,7 @@ streamer = init_streamer()
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.sidebar.title("TITAN V4.0")
+st.sidebar.title("TITAN V6.0")
 mode = st.sidebar.radio("Data Feed", ["Live API (Polygon)", "Simulated"], index=0)
 ticker = st.sidebar.text_input("Ticker", "SPX").upper()
 
@@ -52,6 +51,7 @@ vix = 15
 nodes = []
 net_gex = 0
 flip_level = 0
+expiry_date = "N/A"
 ke = 0
 raw_df = pd.DataFrame()
 
@@ -82,13 +82,14 @@ if mode == "Live API (Polygon)":
             # Use HTTP for the heavy structure
             spot_snap = st.session_state.dm.get_spot_price(ticker)
             vix = st.session_state.dm.get_vix()
-            nodes, net_gex, flip_level, raw_df = st.session_state.dm.get_option_chain_gex(ticker, spot_snap)
+            nodes, net_gex, flip_level, raw_df, expiry_date = st.session_state.dm.get_option_chain_gex(ticker, spot_snap)
             
             # Cache results
             st.session_state.cached_nodes = nodes
             st.session_state.cached_gex = net_gex
             st.session_state.cached_flip = flip_level
             st.session_state.cached_df = raw_df
+            st.session_state.cached_expiry = expiry_date
             st.session_state.last_chain_update = now
     
     # Use Cached Structure + Live Price
@@ -96,6 +97,7 @@ if mode == "Live API (Polygon)":
     net_gex = st.session_state.get('cached_gex', 0)
     flip_level = st.session_state.get('cached_flip', 0)
     raw_df = st.session_state.get('cached_df', pd.DataFrame())
+    expiry_date = st.session_state.get('cached_expiry', "N/A")
     
     # Use WS price if available, else fallback
     if ws_price > 0:
@@ -134,13 +136,13 @@ if len(st.session_state.history) > 60: st.session_state.history.pop(0)
 # DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.title(f"TITAN V4.0 | {ticker}")
+st.title(f"TITAN V6.0 | {ticker} | Expiry: {expiry_date}")
 
 # HUD
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Spot", f"{spot_price:.2f}", f"VIX: {vix:.2f}")
 c2.metric("Gamma Force", result['force_dir'], f"{result['force_conf']:.1f}%")
-c3.metric("Vanna Flow", f"{result['vanna_force']:.2f}", "Vol Sensitivity")
+c3.metric("Kelly Size", f"{result['kelly_size']*100:.1f}%", "Risk Per Trade")
 c4.metric("Status", result['status'], "Latency: ~50ms (WS)")
 
 # MAIN CHART
@@ -222,7 +224,8 @@ with st.expander("⚔️ LIVE TACTICAL GUIDE (Titan Brain)", expanded=True):
         spot_price, net_gex, flip_level, 
         result['force_dir'], result['force_conf'], 
         result['vacuum_active'], result['vanna_force'],
-        result['flow_score'], result['signal']
+        result['flow_score'], result['signal'],
+        result['kelly_size']
     )
     st.markdown(commentary)
 
