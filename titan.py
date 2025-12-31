@@ -2,6 +2,9 @@
 """
 TITAN OMEGA - HOLY GRAIL | SPX Dealer Flow Engine
 ==================================================
+✅ LIVE MODE: Real-time during market hours
+📚 STUDY MODE: Previous session replay after hours
+==================================================
 export POLYGON_API_KEY='key' && python titan.py
 Dashboard: http://localhost:5000
 """
@@ -18,7 +21,39 @@ from flask import Flask,render_template_string,jsonify
 from flask_socketio import SocketIO
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CORE
+# MARKET HOURS CHECKER
+# ═══════════════════════════════════════════════════════════════════════════════
+class MarketHours:
+    """Check if US stock market is open"""
+    @staticmethod
+    def is_open():
+        now = datetime.now()
+        # Market hours: Mon-Fri, 9:30 AM - 4:00 PM Eastern
+        # Simplified: assume server is in ET or close enough
+        weekday = now.weekday()  # 0=Monday, 6=Sunday
+        if weekday >= 5:  # Saturday or Sunday
+            return False
+        hour, minute = now.hour, now.minute
+        market_open = (hour == 9 and minute >= 30) or (hour > 9)
+        market_close = hour < 16
+        return market_open and market_close
+    
+    @staticmethod
+    def get_status():
+        if MarketHours.is_open():
+            return "🟢 MARKET OPEN", "live"
+        now = datetime.now()
+        if now.weekday() >= 5:
+            return "🔴 WEEKEND - Study Mode", "study"
+        hour = now.hour
+        if hour < 9 or (hour == 9 and now.minute < 30):
+            return "🟡 PRE-MARKET - Study Mode", "study"
+        return "🟡 AFTER-HOURS - Study Mode", "study"
+
+MKT = MarketHours()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORE CLASSES
 # ═══════════════════════════════════════════════════════════════════════════════
 class EMA:
     def __init__(s,n=60):s.a=2/(n+1);s.v=s.p=None;s.L=Lock()
@@ -231,12 +266,10 @@ class Gk:
     def __init__(s,cfg):s.cfg=cfg
     @staticmethod
     def nc(x):
-        # Use scipy if available, otherwise manual approximation
         try:
             from scipy.special import erf
             return .5*(1+erf(x/np.sqrt(2)))
         except ImportError:
-            # Approximation for normal CDF
             t = 1.0 / (1.0 + 0.2316419 * np.abs(x))
             d = 0.3989422804014327 * np.exp(-x * x / 2)
             p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))))
@@ -295,26 +328,148 @@ class Dt:
         return Sig(rg,fn,rw,pl,co,gex,vex,cex,dlt,sp,iv,ir,gr,sr,q,nu,nf,nh,ag,sh,cn,dg)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DB
+# DATABASE WITH HISTORY
 # ═══════════════════════════════════════════════════════════════════════════════
 class DB:
     def __init__(s,p):
         s.p=p
         with sqlite3.connect(p)as c:
-            c.execute("CREATE TABLE IF NOT EXISTS sig(id INTEGER PRIMARY KEY,ts TEXT,rg TEXT,cf REAL,gex REAL,sp REAL,ag INT)")
-            c.execute("CREATE TABLE IF NOT EXISTS al(id INTEGER PRIMARY KEY,ts TEXT,tp TEXT,sp REAL,cf REAL)")
-    def sv(s,g):
+            # Main signals table with full data
+            c.execute("""CREATE TABLE IF NOT EXISTS signals(
+                id INTEGER PRIMARY KEY,
+                ts TEXT,
+                date TEXT,
+                time TEXT,
+                rg TEXT,
+                cf REAL,
+                gex REAL,
+                vex REAL,
+                cex REAL,
+                sp REAL,
+                iv REAL,
+                pl TEXT,
+                ag INT
+            )""")
+            # Alerts table
+            c.execute("""CREATE TABLE IF NOT EXISTS alerts(
+                id INTEGER PRIMARY KEY,
+                ts TEXT,
+                date TEXT,
+                time TEXT,
+                tp TEXT,
+                sp REAL,
+                cf REAL,
+                gex REAL,
+                pl TEXT
+            )""")
+            # Session summary
+            c.execute("""CREATE TABLE IF NOT EXISTS sessions(
+                id INTEGER PRIMARY KEY,
+                date TEXT UNIQUE,
+                open_sp REAL,
+                close_sp REAL,
+                high_sp REAL,
+                low_sp REAL,
+                total_signals INT,
+                dominant_regime TEXT,
+                summary TEXT
+            )""")
+    
+    def save_signal(s,g):
         try:
-            with sqlite3.connect(s.p)as c:c.execute("INSERT INTO sig(ts,rg,cf,gex,sp,ag)VALUES(?,?,?,?,?,?)",(g.ts.isoformat(),g.rg.name,g.cf,g.gex,g.sp,g.ag))
+            now = datetime.now()
+            with sqlite3.connect(s.p)as c:
+                c.execute("""INSERT INTO signals(ts,date,time,rg,cf,gex,vex,cex,sp,iv,pl,ag)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (now.isoformat(), now.strftime('%Y-%m-%d'), now.strftime('%H:%M:%S'),
+                     g.rg.name, g.cf, g.gex, g.vex, g.cex, g.sp, g.iv, g.pl, g.ag))
         except:pass
-    def al(s,t,sp,cf):
+    
+    def save_alert(s,rg,sp,cf,gex,pl):
         try:
-            with sqlite3.connect(s.p)as c:c.execute("INSERT INTO al(ts,tp,sp,cf)VALUES(?,?,?,?)",(datetime.now().isoformat(),t,sp,cf))
+            now = datetime.now()
+            with sqlite3.connect(s.p)as c:
+                c.execute("""INSERT INTO alerts(ts,date,time,tp,sp,cf,gex,pl)
+                    VALUES(?,?,?,?,?,?,?,?)""",
+                    (now.isoformat(), now.strftime('%Y-%m-%d'), now.strftime('%H:%M:%S'),
+                     rg, sp, cf, gex, pl))
         except:pass
-    def rc(s,n=5):
+    
+    def get_recent_alerts(s,n=10):
         try:
-            with sqlite3.connect(s.p)as c:return[{'ts':r[0],'tp':r[1],'sp':r[2],'cf':r[3]}for r in c.execute(f"SELECT ts,tp,sp,cf FROM al ORDER BY ts DESC LIMIT {n}")]
+            with sqlite3.connect(s.p)as c:
+                return [{'ts':r[0],'date':r[1],'time':r[2],'tp':r[3],'sp':r[4],'cf':r[5],'gex':r[6],'pl':r[7]} 
+                    for r in c.execute(f"SELECT ts,date,time,tp,sp,cf,gex,pl FROM alerts ORDER BY ts DESC LIMIT {n}")]
         except:return[]
+    
+    def get_session_signals(s, date=None):
+        """Get all signals for a specific date (defaults to last trading day)"""
+        try:
+            with sqlite3.connect(s.p)as c:
+                if date:
+                    query = "SELECT * FROM signals WHERE date=? ORDER BY ts"
+                    rows = c.execute(query, (date,)).fetchall()
+                else:
+                    # Get the most recent date with signals
+                    date_row = c.execute("SELECT DISTINCT date FROM signals ORDER BY date DESC LIMIT 1").fetchone()
+                    if not date_row:
+                        return [], None
+                    date = date_row[0]
+                    rows = c.execute("SELECT * FROM signals WHERE date=? ORDER BY ts", (date,)).fetchall()
+                
+                signals = []
+                for r in rows:
+                    signals.append({
+                        'id': r[0], 'ts': r[1], 'date': r[2], 'time': r[3],
+                        'rg': r[4], 'cf': r[5], 'gex': r[6], 'vex': r[7],
+                        'cex': r[8], 'sp': r[9], 'iv': r[10], 'pl': r[11], 'ag': r[12]
+                    })
+                return signals, date
+        except Exception as e:
+            logging.error(f"DB error: {e}")
+            return [], None
+    
+    def get_session_summary(s, date=None):
+        """Get summary stats for a session"""
+        signals, actual_date = s.get_session_signals(date)
+        if not signals:
+            return None
+        
+        spots = [sig['sp'] for sig in signals]
+        regimes = [sig['rg'] for sig in signals if sig['rg'] not in ('N', 'SF')]
+        
+        # Count regime occurrences
+        regime_counts = {}
+        for rg in regimes:
+            regime_counts[rg] = regime_counts.get(rg, 0) + 1
+        
+        dominant = max(regime_counts.items(), key=lambda x: x[1])[0] if regime_counts else 'N'
+        
+        # Key signals (high confidence, non-neutral)
+        key_signals = [sig for sig in signals if sig['cf'] >= 60 and sig['rg'] not in ('N', 'SF')]
+        
+        return {
+            'date': actual_date,
+            'total_signals': len(signals),
+            'open_sp': spots[0] if spots else 0,
+            'close_sp': spots[-1] if spots else 0,
+            'high_sp': max(spots) if spots else 0,
+            'low_sp': min(spots) if spots else 0,
+            'range': max(spots) - min(spots) if spots else 0,
+            'dominant_regime': dominant,
+            'regime_counts': regime_counts,
+            'key_signals': key_signals[-20:],  # Last 20 key signals
+            'all_signals': signals
+        }
+    
+    def get_available_dates(s):
+        """Get list of dates with data"""
+        try:
+            with sqlite3.connect(s.p)as c:
+                rows = c.execute("SELECT DISTINCT date FROM signals ORDER BY date DESC LIMIT 30").fetchall()
+                return [r[0] for r in rows]
+        except:
+            return []
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENGINE
@@ -349,6 +504,9 @@ class Eng:
     async def _main(s,sio):
         while s.run:
             try:
+                # Check market status
+                mkt_status, mkt_mode = MKT.get_status()
+                
                 sn=S.sn();sp=sn['sp']or s.cfg.FB
                 if sn['sp']<=0:S.ssp(sp)
                 ch=sn['ch']or s._demo(sp)
@@ -359,20 +517,34 @@ class Eng:
                 sg=s.dt.det(gex,vex,cex,dlt,sp,sn['iv'],sn['ir'],sn['gr'],sn['sr'],q,ag,ft.n,nf,ch.hl,sh,ch.n)
                 S.ssg(sg)
                 
+                # Save to database
                 if sg.rg not in(Rg.N,Rg.SF)and sg.cf>50:
                     dr='down'if sg.rg in(Rg.WF,Rg.FL)else'up'if sg.rg in(Rg.CH,Rg.SQ)else'pin'
-                    CL.rec(dr,sp,gex,sg.cf,sg.rg.name);s.db.sv(sg);s.db.al(sg.rg.name,sp,sg.cf)
+                    CL.rec(dr,sp,gex,sg.cf,sg.rg.name)
+                    s.db.save_signal(sg)
+                    s.db.save_alert(sg.rg.name, sp, sg.cf, gex, sg.pl)
+                
+                # Get historical data for study mode
+                hist_summary = None
+                if mkt_mode == 'study':
+                    hist_summary = s.db.get_session_summary()
                 
                 ca=CL.analyze()
-                sio.emit('u',{
+                
+                # Emit update
+                emit_data = {
                     'r':sg.rg.name,'c':round(sg.cf,1),'p':sg.pl,'co':sg.co,
                     'gex':round(gex/1e6,2),'vex':round(vex/1e6,2),'cex':round(cex/1e6,2),
                     'sp':round(sp,2),'iv':round(sn['iv']*100,2),'ir':round(sn['ir']*100,4),
                     'ts':datetime.now().strftime('%H:%M:%S'),'q':q.name,'nu':ft.n,
                     'nh':ch.hl,'ag':ag,'sh':round(sh,3),'cn':ch.n,'dg':sg.dg,
                     'cs':ca.get('st',''),'ca':ca.get('acc',0),'csig':ca.get('n',0),
-                    'sug':ca.get('sug',[]),'bk':bk,'al':s.db.rc(5)
-                })
+                    'sug':ca.get('sug',[]),'bk':bk,'al':s.db.get_recent_alerts(5),
+                    'mkt_status': mkt_status, 'mkt_mode': mkt_mode,
+                    'hist': hist_summary
+                }
+                sio.emit('u', emit_data)
+                
                 if sg.rg!=Rg.N:logging.info(f"🎯{sg.rg.name}|{sg.cf:.0f}%|Ag:{ag}")
             except Exception as e:logging.error(f"E:{e}")
             await asyncio.sleep(1)
@@ -396,15 +568,15 @@ class Eng:
     def stop(s):s.run=False;s.fd.stop();CL.exp()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DASHBOARD
+# DASHBOARD WITH STUDY MODE
 # ═══════════════════════════════════════════════════════════════════════════════
-HTML="""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TITAN</title>
+HTML="""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TITAN OMEGA</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 :root{--b:#09090b;--c:#18181b;--d:#27272a;--t:#fafafa;--m:#71717a;--g:#22c55e;--r:#ef4444;--l:#3b82f6;--y:#eab308;--o:#f97316}
 *{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui;background:var(--b);color:var(--t);min-height:100vh}
-.D{display:grid;grid-template-columns:1fr 280px;min-height:100vh}
+.D{display:grid;grid-template-columns:1fr 300px;min-height:100vh}
 .M{padding:8px;display:flex;flex-direction:column;gap:6px}
 .H{display:flex;justify-content:space-between;align-items:center;padding-bottom:5px;border-bottom:1px solid var(--d)}
 .L{display:flex;align-items:center;gap:5px}
@@ -413,6 +585,9 @@ HTML="""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" c
 .S{display:flex;align-items:center;gap:3px;font-size:7px}
 .O{width:5px;height:5px;border-radius:50%;background:var(--g);animation:p 2s infinite}
 .O.w{background:var(--y)}.O.x{background:var(--r)}@keyframes p{0%,100%{opacity:1}50%{opacity:.5}}
+.MKT{font-size:8px;padding:2px 6px;border-radius:3px;margin-left:5px}
+.MKT.live{background:#166534;color:#86efac}
+.MKT.study{background:#854d0e;color:#fef08a}
 .G{display:grid;grid-template-columns:repeat(6,1fr);gap:4px}
 .B{background:var(--c);border-radius:4px;padding:5px}
 .BL{font-size:6px;color:var(--m);text-transform:uppercase;margin-bottom:1px}
@@ -426,7 +601,7 @@ HTML="""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" c
 .HB{flex:1;height:8px;border-radius:2px;overflow:hidden}
 .HF{height:100%}.HF.p{background:var(--g)}.HF.n{background:var(--r)}
 .HV{width:35px;text-align:right;font-family:monospace;font-size:6px}
-.SD{background:var(--c);border-left:1px solid var(--d);padding:8px;display:flex;flex-direction:column;gap:5px;transition:background .5s}
+.SD{background:var(--c);border-left:1px solid var(--d);padding:8px;display:flex;flex-direction:column;gap:5px;transition:background .5s;overflow-y:auto}
 .SD.FL{background:linear-gradient(180deg,#450a0a 0%,var(--c) 25%)}
 .SD.WF{background:linear-gradient(180deg,#7f1d1d 0%,var(--c) 25%)}
 .SD.CH{background:linear-gradient(180deg,#064e3b 0%,var(--c) 25%)}
@@ -438,7 +613,7 @@ HTML="""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" c
 .RN{font-size:10px;font-weight:700;text-transform:uppercase}
 .RC{font-family:monospace;font-size:8px;padding:1px 3px;background:rgba(255,255,255,.1);border-radius:2px}
 .RC.dg{color:var(--o)}
-.PL{background:var(--b);border-radius:3px;padding:5px;font-family:monospace;font-size:8px;line-height:1.2;white-space:pre-wrap;max-height:110px;overflow-y:auto}
+.PL{background:var(--b);border-radius:3px;padding:5px;font-family:monospace;font-size:8px;line-height:1.2;white-space:pre-wrap;max-height:90px;overflow-y:auto}
 .DQ{background:#27272a;border-radius:3px;padding:5px;font-size:7px}
 .DT{font-weight:600;margin-bottom:2px}
 .DR{display:flex;justify-content:space-between;padding:1px 0}
@@ -447,14 +622,30 @@ HTML="""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" c
 .CL{background:#27272a;border-radius:3px;padding:5px;font-size:7px}
 .CT{font-weight:600;margin-bottom:2px;color:var(--y)}
 .SG{background:var(--b);border-radius:2px;padding:2px;margin-top:2px;font-size:6px;color:var(--y)}
-.AL{flex:1}.AT{font-size:7px;color:var(--m);margin-bottom:2px}
+.AL{margin-top:5px}.AT{font-size:7px;color:var(--m);margin-bottom:2px;display:flex;justify-content:space-between}
 .A{background:var(--b);border-radius:2px;padding:3px;margin-bottom:2px;border-left:2px solid var(--l);font-size:6px}
-.A.FL{border-color:var(--r)}.A.WF{border-color:#dc2626}.A.CH{border-color:var(--g)}
+.A.FL{border-color:var(--r)}.A.WF{border-color:#dc2626}.A.CH{border-color:var(--g)}.A.SQ{border-color:#14b8a6}.A.PN{border-color:var(--l)}
 .AX{color:var(--m);font-family:monospace}.AN{font-weight:600}
+.AP{font-size:5px;color:var(--m);margin-top:1px}
+.STUDY{background:linear-gradient(135deg,#422006,#1c1917);border:1px solid #854d0e;border-radius:4px;padding:6px;margin-bottom:5px}
+.STUDY-H{font-size:9px;font-weight:700;color:#fef08a;margin-bottom:4px;display:flex;align-items:center;gap:4px}
+.STUDY-S{display:grid;grid-template-columns:repeat(2,1fr);gap:4px;font-size:7px}
+.STUDY-I{background:rgba(0,0,0,.3);padding:3px;border-radius:2px}
+.STUDY-L{color:#a3a3a3}.STUDY-V{font-weight:600;color:#fef08a}
+.SIG-LIST{max-height:200px;overflow-y:auto;margin-top:5px}
+.SIG{background:var(--b);border-radius:2px;padding:3px;margin-bottom:2px;font-size:6px;border-left:2px solid var(--d)}
+.SIG.FL{border-color:var(--r)}.SIG.WF{border-color:#dc2626}.SIG.CH{border-color:var(--g)}.SIG.SQ{border-color:#14b8a6}.SIG.PN{border-color:var(--l)}
+.SIG-T{color:var(--m);font-family:monospace}.SIG-R{font-weight:600}.SIG-D{color:var(--m);margin-top:1px}
 </style></head><body>
 <div class="D">
 <div class="M">
-<div class="H"><div class="L"><div class="I">Ω</div><div><h1>TITAN OMEGA</h1><span>Holy Grail|All Features</span></div></div><div class="S"><div class="O" id="o"></div><span id="s">...</span></div></div>
+<div class="H">
+<div class="L"><div class="I">Ω</div><div><h1>TITAN OMEGA</h1><span>Holy Grail|SPX Flow</span></div></div>
+<div class="S">
+<div class="O" id="o"></div><span id="s">...</span>
+<span class="MKT" id="mkt">--</span>
+</div>
+</div>
 <div class="G">
 <div class="B"><div class="BL">SPX</div><div class="BV" id="sp">--</div></div>
 <div class="B"><div class="BL">GEX</div><div class="BV" id="gx">--</div></div>
@@ -463,33 +654,87 @@ HTML="""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" c
 <div class="B"><div class="BL">Chain</div><div class="BV" id="cn">--</div><div class="BS">H:<span id="nh">0</span></div></div>
 <div class="B"><div class="BL">Age</div><div class="BV" id="ag">--</div></div>
 </div>
-<div class="C"><div class="CH"><span>GEX</span><span id="ts">--</span></div><canvas id="cv" height="100"></canvas></div>
-<div class="HM"><div class="CH"><span>Strikes</span></div><div id="hm"></div></div>
+<div class="C"><div class="CH"><span>GEX Timeline</span><span id="ts">--</span></div><canvas id="cv" height="100"></canvas></div>
+<div class="HM"><div class="CH"><span>Strike GEX</span></div><div id="hm"></div></div>
 </div>
 <div class="SD" id="sd">
 <div class="RG"><div class="RH"><span class="RN" id="rg">INIT</span><span class="RC" id="cf">--</span></div><div class="PL" id="pl">Loading...</div></div>
+
+<!-- STUDY MODE PANEL -->
+<div class="STUDY" id="study" style="display:none">
+<div class="STUDY-H">📚 STUDY MODE - Previous Session</div>
+<div class="STUDY-S">
+<div class="STUDY-I"><div class="STUDY-L">Date</div><div class="STUDY-V" id="st-date">--</div></div>
+<div class="STUDY-I"><div class="STUDY-L">Signals</div><div class="STUDY-V" id="st-cnt">--</div></div>
+<div class="STUDY-I"><div class="STUDY-L">Open</div><div class="STUDY-V" id="st-open">--</div></div>
+<div class="STUDY-I"><div class="STUDY-L">Close</div><div class="STUDY-V" id="st-close">--</div></div>
+<div class="STUDY-I"><div class="STUDY-L">High</div><div class="STUDY-V" id="st-high">--</div></div>
+<div class="STUDY-I"><div class="STUDY-L">Low</div><div class="STUDY-V" id="st-low">--</div></div>
+<div class="STUDY-I"><div class="STUDY-L">Range</div><div class="STUDY-V" id="st-range">--</div></div>
+<div class="STUDY-I"><div class="STUDY-L">Dominant</div><div class="STUDY-V" id="st-dom">--</div></div>
+</div>
+<div class="AT" style="margin-top:5px"><span>Key Signals</span></div>
+<div class="SIG-LIST" id="st-sigs"></div>
+</div>
+
 <div class="DQ">
-<div class="DT">📡Data</div>
+<div class="DT">📡 Data Quality</div>
 <div class="DR"><span class="DL">Quality</span><span class="DV" id="ql">--</span></div>
 <div class="DR"><span class="DL">Age</span><span class="DV" id="a2">--</span></div>
 <div class="DR"><span class="DL">Degraded</span><span class="DV" id="dg">--</span></div>
 </div>
 <div class="CL">
-<div class="CT">📊Cal(25+sig)</div>
+<div class="CT">📊 Calibration</div>
 <div class="DR"><span class="DL">Status</span><span class="DV" id="cs">--</span></div>
-<div class="DR"><span class="DL">Acc</span><span class="DV g" id="ca">--</span></div>
+<div class="DR"><span class="DL">Accuracy</span><span class="DV g" id="ca">--</span></div>
 <div id="sg"></div>
 </div>
-<div class="AL"><div class="AT">Recent</div><div id="al"></div></div>
+<div class="AL"><div class="AT"><span>📋 Recent Alerts</span></div><div id="al"></div></div>
 </div>
 </div>
 <script>
 const io=window.io(),gD=[],gL=[];
 const cx=document.getElementById('cv').getContext('2d');
-const ct=new Chart(cx,{type:'line',data:{labels:gL,datasets:[{data:gD,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,.1)',fill:true,tension:.4,pointRadius:0,borderWidth:1.5}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{display:true,grid:{color:'#27272a'},ticks:{color:'#71717a',maxTicksLimit:4,font:{size:7}}},y:{display:true,grid:{color:'#27272a'},ticks:{color:'#71717a',callback:v=>v+'M',font:{size:7}}}},animation:{duration:0}}});
+const ct=new Chart(cx,{type:'line',data:{labels:gL,datasets:[{data:gD,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,.1)',fill:true,tension:.4,pointRadius:0,borderWidth:1.5}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{display:true,grid:{color:'#27272a'},ticks:{color:'#71717a',maxTicksLimit:6,font:{size:7}}},y:{display:true,grid:{color:'#27272a'},ticks:{color:'#71717a',callback:v=>v+'M',font:{size:7}}}},animation:{duration:0}}});
+
 io.on('connect',()=>{document.getElementById('s').textContent='Live';document.getElementById('o').className='O'});
 io.on('disconnect',()=>{document.getElementById('s').textContent='Off';document.getElementById('o').className='O x'});
+
 io.on('u',d=>{
+// Market status
+const mkt=document.getElementById('mkt');
+mkt.textContent=d.mkt_status||'--';
+mkt.className='MKT '+(d.mkt_mode||'study');
+
+// Show/hide study panel
+const studyPanel=document.getElementById('study');
+if(d.mkt_mode==='study' && d.hist){
+    studyPanel.style.display='block';
+    const h=d.hist;
+    document.getElementById('st-date').textContent=h.date||'--';
+    document.getElementById('st-cnt').textContent=h.total_signals||0;
+    document.getElementById('st-open').textContent=h.open_sp?.toFixed(2)||'--';
+    document.getElementById('st-close').textContent=h.close_sp?.toFixed(2)||'--';
+    document.getElementById('st-high').textContent=h.high_sp?.toFixed(2)||'--';
+    document.getElementById('st-low').textContent=h.low_sp?.toFixed(2)||'--';
+    document.getElementById('st-range').textContent=h.range?.toFixed(2)||'--';
+    document.getElementById('st-dom').textContent=h.dominant_regime||'--';
+    
+    // Key signals list
+    const sigList=document.getElementById('st-sigs');
+    sigList.innerHTML='';
+    if(h.key_signals){
+        h.key_signals.slice().reverse().forEach(sig=>{
+            const el=document.createElement('div');
+            el.className='SIG '+sig.rg;
+            el.innerHTML=`<div><span class="SIG-T">${sig.time}</span> <span class="SIG-R">${sig.rg}</span> ${sig.cf?.toFixed(0)}%</div><div class="SIG-D">SPX:${sig.sp?.toFixed(2)} GEX:${(sig.gex/1e6)?.toFixed(1)}M</div>`;
+            sigList.appendChild(el);
+        });
+    }
+}else{
+    studyPanel.style.display='none';
+}
+
 document.getElementById('sp').textContent=d.sp.toFixed(2);
 const sv=(i,v)=>{const e=document.getElementById(i);e.textContent=v.toFixed(1);e.className='BV '+(v>=0?'p':'n')};
 sv('gx',d.gex);sv('vx',d.vex);
@@ -510,14 +755,16 @@ document.getElementById('ca').textContent=(d.ca||0).toFixed(1)+'%';
 const sg=document.getElementById('sg');sg.innerHTML='';
 if(d.sug&&d.sug.length)d.sug.forEach(x=>{const v=document.createElement('div');v.className='SG';v.textContent='⚠️'+x.t+':'+x.r;sg.appendChild(v)});
 document.getElementById('o').className='O'+(d.q!=='G'||d.dg?' w':'');
-gD.push(d.gex);gL.push(d.ts);if(gD.length>40){gD.shift();gL.shift()}ct.update();
+gD.push(d.gex);gL.push(d.ts);if(gD.length>60){gD.shift();gL.shift()}ct.update();
 const hm=document.getElementById('hm');hm.innerHTML='';
-const bk=Object.entries(d.bk).sort((a,b)=>+b[0]-+a[0]).slice(0,6);
+const bk=Object.entries(d.bk).sort((a,b)=>+b[0]-+a[0]).slice(0,8);
 const mx=Math.max(...bk.map(x=>Math.abs(x[1].g)),1);
 bk.forEach(([k,v])=>{const r=document.createElement('div');r.className='HR';const p=v.g>=0;
 r.innerHTML='<div class="HK">'+k+'</div><div class="HB"><div class="HF '+(p?'p':'n')+'" style="width:'+Math.abs(v.g)/mx*100+'%"></div></div><div class="HV" style="color:'+(p?'#22c55e':'#ef4444')+'">'+(v.g>0?'+':'')+v.g.toFixed(1)+'M</div>';hm.appendChild(r)});
 const al=document.getElementById('al');al.innerHTML='';
-d.al.forEach(a=>{const e=document.createElement('div');e.className='A '+a.tp;e.innerHTML='<div class="AX">'+(a.ts?.slice(11,19)||'')+'</div><div class="AN">'+a.tp+' '+((a.cf||0).toFixed(0))+'%</div>';al.appendChild(e)});
+if(d.al)d.al.forEach(a=>{const e=document.createElement('div');e.className='A '+(a.tp||'');
+e.innerHTML='<div class="AX">'+(a.time||a.ts?.slice(11,19)||'')+'</div><div class="AN">'+(a.tp||'')+' '+((a.cf||0).toFixed(0))+'%</div><div class="AP">SPX:'+(a.sp?.toFixed(2)||'--')+' GEX:'+(a.gex?(a.gex/1e6).toFixed(1)+'M':'--')+'</div>';
+al.appendChild(e)});
 });
 </script></body></html>"""
 
@@ -528,16 +775,33 @@ def app(cfg=None):
     a=Flask(__name__);a.config['SECRET_KEY']=os.urandom(24).hex()
     sio=SocketIO(a,cors_allowed_origins="*",async_mode='threading')
     cfg=cfg or Cfg();eng=Eng(cfg)
+    
     @a.route('/')
     def idx():return render_template_string(HTML)
+    
     @a.route('/cal')
     def cal():return jsonify(CL.analyze())
+    
+    @a.route('/api/history')
+    def history():
+        date = request.args.get('date')
+        summary = eng.db.get_session_summary(date)
+        return jsonify(summary or {})
+    
+    @a.route('/api/dates')
+    def dates():
+        return jsonify(eng.db.get_available_dates())
+    
     return a,sio,eng
 
 def main():
     print("═"*60+"\n  TITAN OMEGA - HOLY GRAIL\n  SPX Dealer Flow Engine\n"+"═"*60)
     print(f"\n{'✅'if os.environ.get('POLYGON_API_KEY')else'⚠️'} API: {'OK'if os.environ.get('POLYGON_API_KEY')else'export POLYGON_API_KEY=...'}")
-    print("📊 http://localhost:5000\n")
+    
+    mkt_status, mkt_mode = MKT.get_status()
+    print(f"📊 Market: {mkt_status}")
+    print(f"🌐 http://localhost:5000\n")
+    
     cfg=Cfg();a,sio,eng=app(cfg)
     def shut(*_):print("\n🛑");eng.stop();sys.exit(0)
     sg.signal(sg.SIGINT,shut);sg.signal(sg.SIGTERM,shut)
