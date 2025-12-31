@@ -1,2 +1,7 @@
 streamlit
 pandas
+numpy
+aiohttp
+websocket-client
+flask
+flask-socketio
