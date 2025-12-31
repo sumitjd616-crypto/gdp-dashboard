@@ -1,15 +1,23 @@
 """
 TITAN FLOW INTELLIGENCE MODULE
 ==============================
-Options flow analysis and dark pool detection
+Options flow analysis using ACCESSIBLE data sources
 
 Features:
 - Sweep detection (multi-exchange urgency)
 - Block trade identification
-- Dark pool print analysis
 - Smart money flow scoring
 - Unusual activity detection
 - Net premium flow calculation
+
+ACCESSIBLE via:
+- Polygon.io options trades
+- CBOE/exchange time & sales
+- Options volume/OI data
+
+NOT accessible (removed):
+- Dark pool prints (requires institutional feeds)
+- Exact dealer positioning
 """
 
 from dataclasses import dataclass, field
@@ -35,10 +43,6 @@ class FlowConfig:
     # Block detection
     BLOCK_SIZE: int = 200                # Large single print
     MEGA_BLOCK_SIZE: int = 1000          # Very large print
-    
-    # Dark pool
-    DP_MIN_VALUE: float = 500_000        # $500K minimum
-    DP_SPOT_RANGE: float = 0.01          # Within 1% of spot
     
     # Premium flow
     PREMIUM_LOOKBACK_MIN: int = 30       # 30 minute window

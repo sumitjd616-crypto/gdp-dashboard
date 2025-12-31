@@ -9,12 +9,21 @@
 ║  • Omega v17.5: Market mood + Trade archiving + Alert system                ║
 ║  • Realtime: Dealer mechanics + WHY explanation + Entry finder              ║
 ║                                                                              ║
+║  NEW in v19.1: Order Flow + Intraday Levels                                 ║
+║  • ES Order Book analysis (accessible via broker APIs)                       ║
+║  • Cumulative Delta tracking                                                 ║
+║  • Market Internals (TICK, ADD, VOLD, TRIN)                                 ║
+║  • VWAP, Opening Range, Initial Balance, PDH/PDL                            ║
+║  • Volume Profile / Value Area                                               ║
+║                                                                              ║
 ║  PURPOSE: Catch big SPX moves BEFORE they happen by understanding:          ║
 ║  1. WHERE dealers are positioned (GEX)                                      ║
 ║  2. HOW they must hedge (mechanics)                                         ║
-║  3. WHAT flow is telling us (smart money)                                   ║
-║  4. WHEN to enter (confluence)                                              ║
+║  3. WHAT flow is telling us (smart money via sweeps/blocks)                 ║
+║  4. WHEN to enter (confluence at key levels)                                ║
+║  5. Market breadth confirmation (internals)                                  ║
 ║                                                                              ║
+║  ACCESSIBLE data only - no dark pool or prop desk data required              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
