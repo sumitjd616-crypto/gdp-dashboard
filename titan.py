@@ -139,7 +139,22 @@ class Cfg:
     @property
     def KEY(s):return os.environ.get('POLYGON_API_KEY','')
     R:float=.053;GF:float=-1.5e8;GS:float=1.2e8;GX:float=-3e8;IT:float=.001
-    PS:int=1000;PM:int=5;DB:str="titan.db";H:str="0.0.0.0";P:int=5000;FB:float=5970
+    PS:int=1000;PM:int=5;DB:str="titan.db";H:str="0.0.0.0";P:int=5000;FB:float=5896.24  # Will be updated with real data
+    
+    def fetch_real_spx(s):
+        """Fetch real SPX price from Polygon on startup"""
+        import urllib.request
+        try:
+            url = f"https://api.polygon.io/v2/aggs/ticker/I:SPX/prev?apiKey={s.KEY}"
+            with urllib.request.urlopen(url, timeout=10) as r:
+                data = json.loads(r.read().decode())
+                if data.get('results'):
+                    price = data['results'][0].get('c', s.FB)  # Close price
+                    logging.info(f"📊 Real SPX: ${price:.2f}")
+                    return price
+        except Exception as e:
+            logging.warning(f"Could not fetch SPX: {e}")
+        return s.FB
 
 class Rg(Enum):
     N=auto();FL=auto();WF=auto();CH=auto();SQ=auto();PN=auto();SF=auto()
@@ -478,14 +493,20 @@ class Eng:
     def __init__(s,cfg=None):
         s.cfg=cfg or Cfg();s.gk=Gk(s.cfg);s.dt=Dt(s.cfg);s.db=DB(s.cfg.DB);s.fd=Fd(s.cfg);s.run=False
         logging.basicConfig(level=logging.INFO,format='%(asctime)s|%(message)s',datefmt='%H:%M:%S')
+        # Fetch real SPX price on startup
+        if s.cfg.KEY:
+            real_price = s.cfg.fetch_real_spx()
+            s.cfg.FB = real_price
+            S.ssp(real_price)  # Set initial spot price
     
     def _demo(s,S):
-        b=round(S/5)*5;ar=np.arange(b-50,b+55,5);n=len(ar)
+        """Generate demo chain around current real SPX price"""
+        b=round(S/5)*5;ar=np.arange(b-100,b+105,5);n=len(ar)  # Wider range for higher SPX
         K=np.concatenate([ar,ar]);ca=np.concatenate([np.ones(n,dtype=bool),np.zeros(n,dtype=bool)])
         T=np.full(len(K),datetime.now().replace(hour=16).timestamp())
-        m=(S-K)/S;iv=np.clip(.15*(1+np.abs(m)*1.5),.05,.8)
-        oi=5000*np.exp(-12*m**2)*np.where(ca,1,1.3)
-        return Chn(int(time.time()*1000),K,T,iv,oi,oi*.3,ca,0)
+        m=(S-K)/S;iv=np.clip(.12*(1+np.abs(m)*2),.08,.6)  # More realistic IV
+        oi=8000*np.exp(-15*m**2)*np.where(ca,1,1.2)  # Higher OI for higher priced index
+        return Chn(int(time.time()*1000),K,T,iv,oi,oi*.25,ca,0)
     
     async def _chn(s):
         while s.run:
